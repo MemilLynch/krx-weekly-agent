@@ -2,24 +2,107 @@ name: Daily KRX AI Agent
 
 on:
   schedule:
-    # 한국 시간(KST) 평일 16:10 자동 실행 (UTC 07:10)
     - cron: '10 7 * * 1-5'
-  workflow_dispatch: # 수동 즉시 실행 지원
+  workflow_dispatch:
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - name: Python 3.11 설정
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: 필수 라이브러리 설치
         run: pip install pandas requests
-      - name: 에이전트 실행 및 텔레그램 전송
+
+      - name: 수급 데이터 수집 및 텔레그램 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python auto_agent.py
+        run: |
+          cat << 'EOF' > run_agent.py
+          import os
+          import sys
+          import json
+          import datetime
+          import requests
+          import pandas as pd
+
+          gemini_key = os.getenv("GEMINI_API_KEY")
+          bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+          chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+          if not all([gemini_key, bot_token, chat_id]):
+              print("에러: GitHub Secrets 환경변수(3개)가 누락되었습니다.")
+              sys.exit(1)
+
+          print("1. 수급 데이터 API 호출 중...")
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "Referer": "https://finance.daum.net/",
+          }
+          url = "https://finance.daum.net/api/investor/net_buys?market=KOSPI&investor=FOREIGN"
+          res = requests.get(url, headers=headers)
+          
+          if res.status_code != 200:
+              print(f"데이터 수집 실패: HTTP {res.status_code}")
+              sys.exit(1)
+
+          items = res.json().get("data", [])
+          if not items:
+              print("수급 데이터가 비어 있습니다.")
+              sys.exit(1)
+
+          data_list = []
+          for item in items[:20]:
+              data_list.append({
+                  "순위": item.get("rank"),
+                  "종목명": item.get("name"),
+                  "순매수대금(원)": item.get("netBuyPrice", 0),
+                  "순매수거래량(주)": item.get("netBuyVolume", 0),
+                  "현재가": item.get("tradePrice", 0),
+                  "등락률(%)": round(item.get("changeRate", 0) * 100, 2)
+              })
+
+          df = pd.DataFrame(data_list)
+          data_str = df.to_string(index=False)
+          today = datetime.datetime.now().strftime("%Y-%m-%d")
+
+          print("2. AI 분석 리포트 생성 중...")
+          prompt = f"""
+          아래는 오늘({today}) 코스피 외국인 순매수 상위 20개 종목 데이터다:
+          {data_str}
+
+          위 데이터를 기반으로 다음 형식으로 리포트를 작성해라:
+          1. 순매수 상위 1위~10위 종목 (순위, 종목명, 순매수 거래대금(억 원 환산), 순매수 거래량, 등락률)
+          2. 순매수 상위 TOP 3 섹터 및 수급 특징 요약
+          """
+
+          g_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+          g_res = requests.post(
+              g_url, 
+              headers={"Content-Type": "application/json"}, 
+              data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]})
+          )
+          
+          if g_res.status_code != 200:
+              print(f"Gemini API 에러: {g_res.text}")
+              sys.exit(1)
+
+          report_text = f"📊 [{today}] 코스피 외국인 수급 에이전트 리포트\n\n" + g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+          print("3. 텔레그램 발송 중...")
+          tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+          t_res = requests.post(tg_url, data={"chat_id": chat_id, "text": report_text})
+          
+          if t_res.status_code == 200:
+              print("텔레그램 발송 성공 완료!")
+          else:
+              print(f"텔레그램 발송 실패: {t_res.text}")
+              sys.exit(1)
+          EOF
+
+          python run_agent.py
