@@ -16,8 +16,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: 필수 라이브러리 설치
-        run: pip install pykrx google-genai pandas requests
-      - name: KRX 에이전트 실행 및 텔레그램 전송
+        run: pip install pandas requests
+      - name: 에이전트 실행 및 텔레그램 전송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
