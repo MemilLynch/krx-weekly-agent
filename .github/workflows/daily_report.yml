@@ -15,8 +15,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 필수 라이브러리 설치
-        run: pip install requests pandas
+      - name: 필수 패키지 설치
+        run: pip install requests beautifulsoup4 pandas
 
       - name: 수급 수집 및 AI 분석 발송
         env:
@@ -31,6 +31,7 @@ jobs:
           import re
           import datetime
           import requests
+          from bs4 import BeautifulSoup
           import pandas as pd
 
           gemini_key = os.getenv("GEMINI_API_KEY")
@@ -38,11 +39,11 @@ jobs:
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
           if not all([gemini_key, bot_token, chat_id]):
-              print("환경변수 오류: GitHub Secrets 3종이 누락되었습니다.")
+              print("환경변수 오류: GitHub Secrets 3종이 올바르게 설정되었는지 확인하세요.")
               sys.exit(1)
 
-          # 1. 네이버 금융 데이터 수신 및 정규식 직접 추출
-          print("1. 네이버 금융 데이터 수신 중...")
+          # 1. 네이버 금융 외국인 순매수 테이블 수집
+          print("1. 네이버 증권 외국인 순매수 데이터 수집 중...")
           url = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy&mkt_gb=1"
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -51,73 +52,76 @@ jobs:
 
           res = requests.get(url, headers=headers, timeout=15)
           res.encoding = "cp949"
-          html_text = res.text
 
-          # DOM 파서 대신 정규식으로 tr 태그 단위 직접 분할 (파서 오류 원천 차단)
-          rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html_text, re.DOTALL | re.IGNORECASE)
+          soup = BeautifulSoup(res.text, "html.parser")
+          target_table = soup.find("table", class_="type_1")
+          search_area = target_table if target_table else soup
+
           data_list = []
-          rank = 1
+          seen_codes = set()
 
-          for row_str in rows:
-              code_match = re.search(r'code=(\d{6})', row_str)
-              if not code_match:
+          for a in search_area.find_all("a", href=True):
+              if "code=" not in a["href"]:
                   continue
-              code = code_match.group(1)
 
-              name_match = re.search(r'code=\d{6}[^>]*>([^<]+)</a>', row_str)
-              name = name_match.group(1).strip() if name_match else ""
+              m = re.search(r"code=(\d{6})", a["href"])
+              if not m:
+                  continue
+
+              code = m.group(1)
+              if code in seen_codes:
+                  continue
+
+              name = a.get_text(strip=True)
               if not name:
                   continue
 
-              tds_raw = re.findall(r'<td[^>]*>(.*?)</td>', row_str, re.DOTALL | re.IGNORECASE)
-              tds = [re.sub(r'<[^>]+>', '', td).replace('&nbsp;', ' ').strip() for td in tds_raw]
-
-              if len(tds) >= 7:
-                  cur_price = tds[2]
-                  rate = tds[4]
-                  volume = tds[5]
-                  raw_amt = tds[6]
-              elif len(tds) >= 5:
-                  cur_price = tds[1]
-                  rate = tds[2]
-                  volume = tds[3]
-                  raw_amt = tds[4]
-              else:
+              tr = a.find_parent("tr")
+              if not tr:
                   continue
 
-              num_only = re.sub(r'[^\d.]', '', raw_amt)
-              if num_only:
-                  try:
-                      amt_100m = f"{round(float(num_only) / 100, 1):,}억"
-                  except Exception:
-                      amt_100m = raw_amt
-              else:
-                  amt_100m = raw_amt
+              tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+              if len(tds) >= 6:
+                  seen_codes.add(code)
+                  cur_price = tds[2] if len(tds) > 2 else "-"
+                  rate = tds[4] if len(tds) > 4 else "-"
+                  volume = tds[5] if len(tds) > 5 else "-"
+                  raw_amt = tds[6] if len(tds) > 6 else "-"
 
-              data_list.append({
-                  "순위": rank,
-                  "종목명": name,
-                  "종목코드": code,
-                  "현재가": cur_price,
-                  "등락률": rate,
-                  "순매수거래량": volume,
-                  "순매수대금": amt_100m
-              })
-              rank += 1
-              if rank > 20:
-                  break
+                  # 백만원 -> 억원 환산
+                  num_only = re.sub(r"[^\d.]", "", raw_amt)
+                  if num_only:
+                      try:
+                          amt_100m = f"{round(float(num_only) / 100, 1):,}억"
+                      except Exception:
+                          amt_100m = raw_amt
+                  else:
+                      amt_100m = raw_amt
+
+                  data_list.append({
+                      "순위": len(data_list) + 1,
+                      "종목명": name,
+                      "종목코드": code,
+                      "현재가": cur_price,
+                      "등락률": rate,
+                      "순매수거래량": volume,
+                      "순매수대금": amt_100m
+                  })
+
+                  if len(data_list) >= 20:
+                      break
 
           if not data_list:
-              print(f"데이터 추출 실패: 매칭된 종목 0건 (HTML 길이: {len(html_text)})")
+              print(f"데이터 추출 실패: 테이블 탐색 0건 (HTML 길이: {len(res.text)})")
               sys.exit(1)
 
           df = pd.DataFrame(data_list)
           data_str = df.to_string(index=False)
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"수집 성공! 상위 {len(df)}개 종목 추출 완료.")
+          print(f"수집 성공: 상위 {len(df)}개 종목 파싱 완료")
 
-          # 2. Gemini AI 수급 리포트 생성
-          print("2. Gemini AI 수급 분석 리포트 생성 중...")
+          # 2. Gemini 리포트 생성
+          print("2. AI 수급 분석 리포트 생성 중...")
           prompt = f"""
           아래는 오늘({today}) 기준 코스피(KOSPI) 외국인 순매수 상위 20개 종목 공식 데이터다:
           {data_str}
@@ -139,7 +143,7 @@ jobs:
           report_text = f"📊 [{today}] 코스피 외국인 수급 리포트\n\n" + report_content
 
           # 3. 텔레그램 발송
-          print("3. 텔레그램 발송 중...")
+          print("3. 텔레그램 메시지 발송 중...")
           tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
           t_res = requests.post(tg_url, data={"chat_id": chat_id, "text": report_text})
 
