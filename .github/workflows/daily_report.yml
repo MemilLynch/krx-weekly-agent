@@ -2,6 +2,7 @@ name: Daily KRX AI Agent
 
 on:
   schedule:
+    # 한국 시간(KST) 평일 16:10 실행 (UTC 07:10)
     - cron: '10 7 * * 1-5'
   workflow_dispatch:
 
@@ -14,10 +15,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 필수 라이브러리 설치
-        run: pip install pandas requests beautifulsoup4
+      - name: 필수 패키지 설치
+        run: pip install requests beautifulsoup4 pandas
 
-      - name: 수급 데이터 수집 및 텔레그램 발송
+      - name: 수급 수집 및 AI 분석 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -27,6 +28,7 @@ jobs:
           import os
           import sys
           import json
+          import re
           import datetime
           import requests
           from bs4 import BeautifulSoup
@@ -37,78 +39,104 @@ jobs:
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
           if not all([gemini_key, bot_token, chat_id]):
-              print("에러: GitHub Secrets 환경변수(3개)가 누락되었습니다.")
+              print("환경변수 에러: GitHub Secrets 3종(GEMINI, BOT, CHAT) 중 누락된 값이 있습니다.")
               sys.exit(1)
 
-          print("1. 네이버 금융 코스피 외국인 순매수 데이터 수집 중...")
+          # 1. 네이버 금융 외국인 순매수 페이지 파싱
+          print("1. 네이버 금융 외국인 순매수 DOM 파싱 시작...")
           url = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy&mkt_gb=1"
           headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+              "Referer": "https://finance.naver.com/"
           }
+
           res = requests.get(url, headers=headers)
           res.encoding = "cp949"
 
           if res.status_code != 200:
-              print(f"데이터 수집 실패: HTTP {res.status_code}")
+              print(f"HTTP 요청 실패: {res.status_code}")
               sys.exit(1)
 
           soup = BeautifulSoup(res.text, "html.parser")
-          data_list = []
+          rows = soup.select("table.type_1 tr")
 
-          for tr in soup.find_all("tr"):
-              tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-              # 순위(숫자), 종목명, 현재가, 전일비, 등락률, 매수량, 순매수대금(백만원)
-              if len(tds) >= 7 and tds[0].isdigit():
+          data_list = []
+          rank = 1
+
+          for row in rows:
+              title_tag = row.select_one("a.tit")
+              if not title_tag:
+                  continue
+
+              name = title_tag.get_text(strip=True)
+              code_match = re.search(r"code=(\d+)", title_tag.get("href", ""))
+              code = code_match.group(1) if code_match else ""
+
+              all_tds = row.find_all("td")
+              if len(all_tds) >= 7:
+                  cur_price = all_tds[2].get_text(strip=True).replace(",", "")
+                  change_rate = all_tds[4].get_text(strip=True)
+                  volume = all_tds[5].get_text(strip=True).replace(",", "")
+                  net_buy_mil = all_tds[6].get_text(strip=True).replace(",", "")
+
+                  try:
+                      net_buy_100m = round(float(net_buy_mil) / 100, 1)  # 100백만 원 = 1억 원
+                  except ValueError:
+                      net_buy_100m = 0
+
                   data_list.append({
-                      "순위": int(tds[0]),
-                      "종목명": tds[1],
-                      "현재가": tds[2],
-                      "등락률": tds[4],
-                      "순매수거래량(주)": tds[5],
-                      "순매수대금(백만원)": tds[6]
+                      "순위": rank,
+                      "종목명": name,
+                      "종목코드": code,
+                      "순매수대금(억원)": f"{net_buy_100m:,}억",
+                      "순매수거래량(주)": f"{int(volume):,}" if volume.isdigit() else volume,
+                      "현재가": cur_price,
+                      "등락률": change_rate
                   })
+                  rank += 1
+                  if rank > 20:
+                      break
 
           if not data_list:
-              print("데이터 파싱 실패: 집계 데이터가 없습니다.")
+              print("데이터 파싱 실패: 종목 데이터를 추출하지 못했습니다.")
               sys.exit(1)
 
-          # 상위 20개 종목 추출
-          df = pd.DataFrame(data_list[:20])
+          df = pd.DataFrame(data_list)
           data_str = df.to_string(index=False)
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"데이터 수집 성공 ({len(df)}개 종목)")
+          print(f"파싱 성공: {len(df)}개 종목 수집 완료")
 
-          print("2. AI 분석 리포트 생성 중...")
+          # 2. Gemini 리포트 생성
+          print("2. Gemini API 수급 분석 요청 중...")
           prompt = f"""
-          아래는 오늘({today}) 코스피(KOSPI) 외국인 순매수 상위 20개 종목 공식 데이터다 (단위: 백만원):
+          아래는 오늘({today}) 코스피 외국인 순매수 상위 20개 공식 데이터다:
           {data_str}
 
-          위 데이터를 기반으로 다음 형식의 보고서를 작성해라:
-          1. 순매수 상위 1위~10위 종목 테이블 (순위, 종목명, 순매수대금(억 원 환산), 순매수거래량, 등락률)
-          2. 순매수 상위 TOP 3 섹터 및 수급 특징 요약 (실제 데이터에 근거할 것)
+          위 데이터를 바탕으로 다음 형식에 맞춰 리포트를 작성해라:
+          1. 순매수 상위 1위~10위 종목 테이블 (순위, 종목명, 순매수대금(억원), 순매수거래량, 등락률)
+          2. 순매수 상위 TOP 3 섹터 및 수급 특징 요약 (실제 데이터에 기반할 것)
           """
 
           g_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-          g_res = requests.post(
-              g_url,
-              headers={"Content-Type": "application/json"},
-              data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]})
-          )
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+          g_res = requests.post(g_url, headers={"Content-Type": "application/json"}, data=json.dumps(payload))
 
           if g_res.status_code != 200:
               print(f"Gemini API 에러: {g_res.text}")
               sys.exit(1)
 
-          report_text = f"📊 [{today}] 코스피 외국인 수급 에이전트 리포트\n\n" + g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+          report_content = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+          report_text = f"📊 [{today}] 코스피 외국인 수급 리포트\n\n" + report_content
 
-          print("3. 텔레그램 발송 중...")
+          # 3. 텔레그램 발송 (특수문자 파싱 오류 방지를 위해 일반 텍스트 모드 사용)
+          print("3. 텔레그램 메시지 발송 중...")
           tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
           t_res = requests.post(tg_url, data={"chat_id": chat_id, "text": report_text})
 
           if t_res.status_code == 200:
-              print("🎉 텔레그램 발송 성공 완료!")
+              print("🎉 텔레그램 전송 완료!")
           else:
-              print(f"텔레그램 발송 실패: {t_res.text}")
+              print(f"텔레그램 전송 실패: {t_res.text}")
               sys.exit(1)
           EOF
 
