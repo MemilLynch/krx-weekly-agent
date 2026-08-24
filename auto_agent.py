@@ -12,7 +12,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 if not all([GEMINI_KEY, BOT_TOKEN, CHAT_ID]):
     raise ValueError("GitHub Secrets 환경변수(3개)가 올바르게 설정되지 않았습니다.")
 
-# 2. IP 차단 없는 포털 API를 통한 외국인 순매수 TOP 20 수집
+# 2. 다음 금융 API를 통한 외국인 순매수 TOP 20 수집
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://finance.daum.net/",
