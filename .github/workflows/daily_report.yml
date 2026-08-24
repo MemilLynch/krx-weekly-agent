@@ -15,10 +15,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 필수 패키지 설치
-        run: pip install requests beautifulsoup4 pandas
+      - name: 필수 라이브러리 설치
+        run: pip install requests pandas
 
-      - name: 수급 수집 및 AI 분석 발송
+      - name: 수급 데이터 수집 및 텔레그램 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -31,7 +31,6 @@ jobs:
           import re
           import datetime
           import requests
-          from bs4 import BeautifulSoup
           import pandas as pd
 
           gemini_key = os.getenv("GEMINI_API_KEY")
@@ -39,54 +38,59 @@ jobs:
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
           if not all([gemini_key, bot_token, chat_id]):
-              print("환경변수 오류: GitHub Secrets 3종이 올바르게 설정되었는지 확인하세요.")
+              print("환경변수 오류: GitHub Secrets 3종을 확인하세요.")
               sys.exit(1)
 
-          # 1. 네이버 금융 실제 데이터 iframe 직접 호출
-          print("1. 네이버 금융 외국인 순매수 실데이터(iframe) 수집 중...")
+          # 1. 네이버 금융 데이터 수신
+          print("1. 네이버 금융 외국인 순매수 실데이터 수집 시작...")
           url = "https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun=9000&type=buy&mkt_gb=1"
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-              "Referer": "https://finance.naver.com/sise/sise_deal_rank.naver"
+              "Referer": "https://finance.naver.com/"
           }
 
           res = requests.get(url, headers=headers, timeout=15)
-          res.encoding = "cp949"
-          soup = BeautifulSoup(res.text, "html.parser")
+          html_text = res.content.decode("cp949", errors="ignore")
 
+          # 닫는 태그(</tr>) 부재 문제 원천 해결: '<tr' 단위로 직접 청크 분할
+          tr_chunks = re.split(r'<tr', html_text, flags=re.IGNORECASE)
           data_list = []
-          rank = 1
 
-          for tr in soup.find_all("tr"):
-              a_tag = tr.find("a", href=re.compile(r"code=(\d{6})"))
-              if not a_tag:
+          for chunk in tr_chunks:
+              code_match = re.search(r'code=(\d{6})', chunk, flags=re.IGNORECASE)
+              name_match = re.search(r'>([^<]+)</a>', chunk)
+              
+              if not (code_match and name_match):
                   continue
 
-              name = a_tag.get_text(strip=True)
+              code = code_match.group(1)
+              name = name_match.group(1).strip()
               if not name:
                   continue
 
-              code = re.search(r"code=(\d{6})", a_tag["href"]).group(1)
-              tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+              # '<td' 단위로 분할하여 텍스트 값만 정제
+              td_chunks = re.split(r'<td', chunk, flags=re.IGNORECASE)[1:]
+              tds = [re.sub(r'<[^>]+>', '', td).replace('&nbsp;', ' ').strip() for td in td_chunks]
 
-              # iframe 테이블 구조: [순위(이미지/숫자), 종목명, 현재가, 전일비, 등락률, 매수량, 순매수대금(백만원)]
+              # 테이블 컬럼 매핑: [0:순위, 1:종목명, 2:현재가, 3:전일비, 4:등락률, 5:매수량, 6:순매수대금(백만원)]
               if len(tds) >= 6:
                   cur_price = tds[2] if len(tds) > 2 else "-"
                   rate = tds[4] if len(tds) > 4 else "-"
                   volume = tds[5] if len(tds) > 5 else "-"
                   raw_amt = tds[6] if len(tds) > 6 else "-"
 
-                  num_str = re.sub(r"[^\d.]", "", raw_amt)
-                  if num_str:
+                  # 백만원 -> 억원 환산
+                  num_only = re.sub(r'[^\d.]', '', raw_amt)
+                  if num_only:
                       try:
-                          amt_100m = f"{round(float(num_str) / 100, 1):,}억"
+                          amt_100m = f"{round(float(num_only) / 100, 1):,}억"
                       except Exception:
                           amt_100m = raw_amt
                   else:
                       amt_100m = raw_amt
 
                   data_list.append({
-                      "순위": rank,
+                      "순위": len(data_list) + 1,
                       "종목명": name,
                       "종목코드": code,
                       "현재가": cur_price,
@@ -94,21 +98,21 @@ jobs:
                       "순매수거래량": volume,
                       "순매수대금": amt_100m
                   })
-                  rank += 1
-                  if rank > 20:
+
+                  if len(data_list) >= 20:
                       break
 
           if not data_list:
-              print(f"데이터 파싱 실패: iframe 파싱 0건 (수신 바이트: {len(res.text)})")
+              print(f"데이터 파싱 실패: 수신 바이트({len(html_text)})")
               sys.exit(1)
 
           df = pd.DataFrame(data_list)
           data_str = df.to_string(index=False)
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"수집 성공: 총 {len(df)}개 종목 파싱 완료!")
+          print(f"수집 성공: 상위 {len(df)}개 종목 파싱 완료!")
 
-          # 2. Gemini 리포트 생성
-          print("2. AI 수급 분석 리포트 생성 중...")
+          # 2. Gemini AI 수급 리포트 생성
+          print("2. Gemini AI 수급 분석 리포트 생성 중...")
           prompt = f"""
           아래는 오늘({today}) 기준 코스피(KOSPI) 외국인 순매수 상위 20개 종목 공식 데이터다:
           {data_str}
