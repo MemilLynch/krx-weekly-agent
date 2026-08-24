@@ -38,7 +38,7 @@ jobs:
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
           if not all([gemini_key, bot_token, chat_id]):
-              print("환경변수 오류: GitHub Secrets 3종을 확인하세요.")
+              print("환경변수 오류: GitHub Secrets 3종(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)을 확인하세요.")
               sys.exit(1)
 
           # 1. 네이버 금융 데이터 수신
@@ -52,58 +52,57 @@ jobs:
           res = requests.get(url, headers=headers, timeout=15)
           html_text = res.content.decode("cp949", errors="ignore")
 
-          # 닫는 태그(</tr>) 부재 문제 원천 해결: '<tr' 단위로 직접 청크 분할
-          tr_chunks = re.split(r'<tr', html_text, flags=re.IGNORECASE)
+          # 종목 링크 직접 매칭 (이미지 태그 오류 원천 차단)
+          pattern = r'href=["\'][^"\']*code=(\d{6})["\'][^>]*>([^<]+)</a>'
+          matches = list(re.finditer(pattern, html_text, re.IGNORECASE))
+
           data_list = []
+          for i, match in enumerate(matches):
+              if len(data_list) >= 20:
+                  break
 
-          for chunk in tr_chunks:
-              code_match = re.search(r'code=(\d{6})', chunk, flags=re.IGNORECASE)
-              name_match = re.search(r'>([^<]+)</a>', chunk)
-              
-              if not (code_match and name_match):
-                  continue
-
-              code = code_match.group(1)
-              name = name_match.group(1).strip()
+              code = match.group(1)
+              name = match.group(2).strip()
               if not name:
                   continue
 
-              # '<td' 단위로 분할하여 텍스트 값만 정제
-              td_chunks = re.split(r'<td', chunk, flags=re.IGNORECASE)[1:]
-              tds = [re.sub(r'<[^>]+>', '', td).replace('&nbsp;', ' ').strip() for td in td_chunks]
+              start = match.end()
+              end = matches[i + 1].start() if i + 1 < len(matches) else start + 1500
+              chunk = html_text[start:end]
 
-              # 테이블 컬럼 매핑: [0:순위, 1:종목명, 2:현재가, 3:전일비, 4:등락률, 5:매수량, 6:순매수대금(백만원)]
-              if len(tds) >= 6:
-                  cur_price = tds[2] if len(tds) > 2 else "-"
-                  rate = tds[4] if len(tds) > 4 else "-"
-                  volume = tds[5] if len(tds) > 5 else "-"
-                  raw_amt = tds[6] if len(tds) > 6 else "-"
+              # 태그 제거 후 데이터 토큰화
+              clean_chunk = re.sub(r'<[^>]+>', ' ', chunk).replace('&nbsp;', ' ')
+              tokens = [t.strip() for t in clean_chunk.split() if t.strip()]
 
-                  # 백만원 -> 억원 환산
-                  num_only = re.sub(r'[^\d.]', '', raw_amt)
-                  if num_only:
-                      try:
-                          amt_100m = f"{round(float(num_only) / 100, 1):,}억"
-                      except Exception:
-                          amt_100m = raw_amt
-                  else:
+              cur_price = tokens[0] if len(tokens) > 0 else "-"
+              rate = next((t for t in tokens if "%" in t), "-")
+              num_tokens = [t for t in tokens if re.search(r'\d', t) and "%" not in t]
+
+              volume = num_tokens[-2] if len(num_tokens) >= 3 else (tokens[3] if len(tokens) > 3 else "-")
+              raw_amt = num_tokens[-1] if len(num_tokens) >= 2 else (tokens[-1] if tokens else "-")
+
+              # 백만원 -> 억원 단위 변환
+              clean_amt = re.sub(r'[^\d.]', '', raw_amt)
+              if clean_amt:
+                  try:
+                      amt_100m = f"{round(float(clean_amt) / 100, 1):,}억"
+                  except Exception:
                       amt_100m = raw_amt
+              else:
+                  amt_100m = raw_amt
 
-                  data_list.append({
-                      "순위": len(data_list) + 1,
-                      "종목명": name,
-                      "종목코드": code,
-                      "현재가": cur_price,
-                      "등락률": rate,
-                      "순매수거래량": volume,
-                      "순매수대금": amt_100m
-                  })
-
-                  if len(data_list) >= 20:
-                      break
+              data_list.append({
+                  "순위": len(data_list) + 1,
+                  "종목명": name,
+                  "종목코드": code,
+                  "현재가": cur_price,
+                  "등락률": rate,
+                  "순매수거래량": volume,
+                  "순매수대금": amt_100m
+              })
 
           if not data_list:
-              print(f"데이터 파싱 실패: 수신 바이트({len(html_text)})")
+              print(f"데이터 파싱 실패 (수신 바이트: {len(html_text)})")
               sys.exit(1)
 
           df = pd.DataFrame(data_list)
@@ -134,7 +133,7 @@ jobs:
           report_text = f"📊 [{today}] 코스피 외국인 수급 리포트\n\n" + report_content
 
           # 3. 텔레그램 발송
-          print("3. 텔레그램 메시지 발송 중...")
+          print("3. 텔레그램 발송 중...")
           tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
           t_res = requests.post(tg_url, data={"chat_id": chat_id, "text": report_text})
 
