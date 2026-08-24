@@ -42,64 +42,51 @@ jobs:
               print("환경변수 오류: GitHub Secrets 3종이 올바르게 설정되었는지 확인하세요.")
               sys.exit(1)
 
-          # 1. 네이버 금융 외국인 순매수 테이블 수집
-          print("1. 네이버 증권 외국인 순매수 데이터 수집 중...")
-          url = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy&mkt_gb=1"
+          # 1. 네이버 금융 실제 데이터 iframe 직접 호출
+          print("1. 네이버 금융 외국인 순매수 실데이터(iframe) 수집 중...")
+          url = "https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun=9000&type=buy&mkt_gb=1"
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-              "Referer": "https://finance.naver.com/"
+              "Referer": "https://finance.naver.com/sise/sise_deal_rank.naver"
           }
 
           res = requests.get(url, headers=headers, timeout=15)
           res.encoding = "cp949"
-
           soup = BeautifulSoup(res.text, "html.parser")
-          target_table = soup.find("table", class_="type_1")
-          search_area = target_table if target_table else soup
 
           data_list = []
-          seen_codes = set()
+          rank = 1
 
-          for a in search_area.find_all("a", href=True):
-              if "code=" not in a["href"]:
+          for tr in soup.find_all("tr"):
+              a_tag = tr.find("a", href=re.compile(r"code=(\d{6})"))
+              if not a_tag:
                   continue
 
-              m = re.search(r"code=(\d{6})", a["href"])
-              if not m:
-                  continue
-
-              code = m.group(1)
-              if code in seen_codes:
-                  continue
-
-              name = a.get_text(strip=True)
+              name = a_tag.get_text(strip=True)
               if not name:
                   continue
 
-              tr = a.find_parent("tr")
-              if not tr:
-                  continue
-
+              code = re.search(r"code=(\d{6})", a_tag["href"]).group(1)
               tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+
+              # iframe 테이블 구조: [순위(이미지/숫자), 종목명, 현재가, 전일비, 등락률, 매수량, 순매수대금(백만원)]
               if len(tds) >= 6:
-                  seen_codes.add(code)
                   cur_price = tds[2] if len(tds) > 2 else "-"
                   rate = tds[4] if len(tds) > 4 else "-"
                   volume = tds[5] if len(tds) > 5 else "-"
                   raw_amt = tds[6] if len(tds) > 6 else "-"
 
-                  # 백만원 -> 억원 환산
-                  num_only = re.sub(r"[^\d.]", "", raw_amt)
-                  if num_only:
+                  num_str = re.sub(r"[^\d.]", "", raw_amt)
+                  if num_str:
                       try:
-                          amt_100m = f"{round(float(num_only) / 100, 1):,}억"
+                          amt_100m = f"{round(float(num_str) / 100, 1):,}억"
                       except Exception:
                           amt_100m = raw_amt
                   else:
                       amt_100m = raw_amt
 
                   data_list.append({
-                      "순위": len(data_list) + 1,
+                      "순위": rank,
                       "종목명": name,
                       "종목코드": code,
                       "현재가": cur_price,
@@ -107,18 +94,18 @@ jobs:
                       "순매수거래량": volume,
                       "순매수대금": amt_100m
                   })
-
-                  if len(data_list) >= 20:
+                  rank += 1
+                  if rank > 20:
                       break
 
           if not data_list:
-              print(f"데이터 추출 실패: 테이블 탐색 0건 (HTML 길이: {len(res.text)})")
+              print(f"데이터 파싱 실패: iframe 파싱 0건 (수신 바이트: {len(res.text)})")
               sys.exit(1)
 
           df = pd.DataFrame(data_list)
           data_str = df.to_string(index=False)
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"수집 성공: 상위 {len(df)}개 종목 파싱 완료")
+          print(f"수집 성공: 총 {len(df)}개 종목 파싱 완료!")
 
           # 2. Gemini 리포트 생성
           print("2. AI 수급 분석 리포트 생성 중...")
