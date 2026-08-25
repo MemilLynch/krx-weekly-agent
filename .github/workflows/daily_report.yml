@@ -57,7 +57,7 @@ jobs:
               "Referer": "https://finance.naver.com/"
           }
 
-          # 1. 양대 시장 외인/기관 순위 수집 (검증된 정규식 토큰 파서)
+          # 1. 양대 시장 외인/기관 순위 수집
           def fetch_deal_rank(mkt_gb, investor_gubun, top_n=10):
               url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
@@ -185,7 +185,7 @@ jobs:
           today = datetime.datetime.now().strftime("%Y-%m-%d")
           print(f"수집 완료: 코스피 외인({len(df_kospi_foreign)}개), 기관({len(df_kospi_inst)}개), 코스닥 외인({len(df_kosdaq_foreign)}개), 기관({len(df_kosdaq_inst)}개), 관심종목({len(df_watchlist)}개)")
 
-          # 2. Gemini AI 리포트 생성 (일반 텍스트 및 <b> 태그만 사용)
+          # 2. Gemini AI 리포트 생성
           print("2. Gemini AI 종합 수급 분석 리포트 생성 중...")
           prompt = f"""
           오늘({today}) 국내 증시 공식 수급 집계 데이터다:
@@ -206,7 +206,7 @@ jobs:
           {df_watchlist.to_string(index=False)}
 
           [★ 필수 서식 규칙 ★]
-          1. <code> 태그 및 백틱(```)은 절대 사용하지 마라. (터치 시 복사되는 보라색 박스 방지)
+          1. <code> 태그 및 백틱(```)은 절대 사용 금지. (보라색 복사 박스 방지)
           2. 마크다운 표(|---|)나 마크다운 볼드(**)를 쓰지 마라.
           3. 강조하고 싶은 제목과 핵심 단어는 오직 <b>텍스트</b> 태그만 사용해라.
           4. 숫자와 가격, 등락률은 일반 글자로 작성해라. (예: 75,000원 (+1.5%))
@@ -233,9 +233,16 @@ jobs:
           • 수급 관점 핵심 체크 포인트
           """
 
-          g_url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=){gemini_key}"
+          api_endpoint = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
-          g_res = requests.post(g_url, headers={"Content-Type": "application/json"}, data=json.dumps(payload))
+          
+          g_res = requests.post(
+              api_endpoint,
+              params={"key": gemini_key},
+              headers={"Content-Type": "application/json"},
+              data=json.dumps(payload),
+              timeout=30
+          )
 
           if g_res.status_code != 200:
               print(f"Gemini API 에러: {g_res.text}")
@@ -269,7 +276,7 @@ jobs:
                       })
 
           send_telegram_html(report_text)
-          print("🎉 시장 랭킹과 관심종목 수급 발송 완료!")
+          print("🎉 시장 랭킹과 관심종목 5일 수급 리포트 발송 성공 완료!")
           EOF
 
           python run_agent.py
