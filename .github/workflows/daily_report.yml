@@ -52,6 +52,11 @@ jobs:
               print("환경변수 오류: GitHub Secrets 3종을 확인하세요.")
               sys.exit(1)
 
+          # 복사 과정에서 섞일 수 있는 마크다운 하이퍼링크 문법 자동 정제 함수
+          def clean_url(raw_url):
+              match = re.search(r'https?://[^\s\)\]]+', str(raw_url))
+              return match.group(0) if match else raw_url
+
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
               "Referer": "https://finance.naver.com/"
@@ -59,7 +64,8 @@ jobs:
 
           # 1. 양대 시장 외인/기관 순위 수집
           def fetch_deal_rank(mkt_gb, investor_gubun, top_n=10):
-              url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
+              raw_url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
+              url = clean_url(raw_url)
               res = requests.get(url, headers=headers, timeout=15)
               html_text = res.content.decode("cp949", errors="ignore")
 
@@ -114,7 +120,8 @@ jobs:
           def fetch_watchlist_5d_trend(watchlist_dict):
               res_list = []
               for name, code in watchlist_dict.items():
-                  url = f"https://finance.naver.com/item/frgn.naver?code={code}"
+                  raw_url = f"https://finance.naver.com/item/frgn.naver?code={code}"
+                  url = clean_url(raw_url)
                   res = requests.get(url, headers=headers, timeout=15)
                   soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
 
@@ -233,7 +240,8 @@ jobs:
           • 수급 관점 핵심 체크 포인트
           """
 
-          api_endpoint = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
+          raw_api = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
+          api_endpoint = clean_url(raw_api)
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
           
           g_res = requests.post(
@@ -253,7 +261,8 @@ jobs:
 
           # 3. 텔레그램 발송
           print("3. 텔레그램 메시지 발송 중...")
-          tg_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
+          raw_tg = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
+          tg_url = clean_url(raw_tg)
 
           def send_telegram_html(text):
               if len(text) <= 4000:
