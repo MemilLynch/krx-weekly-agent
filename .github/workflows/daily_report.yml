@@ -252,4 +252,131 @@ jobs:
           5. 종목명 (순매수대금 / 등락률)
 
           <b>[코스피 기관]</b>
-          1. 종목명 (순매수대금 / 등락
+          1. 종목명 (순매수대금 / 등락률)
+          2. 종목명 (순매수대금 / 등락률)
+          3. 종목명 (순매수대금 / 등락률)
+          4. 종목명 (순매수대금 / 등락률)
+          5. 종목명 (순매수대금 / 등락률)
+
+          <b>[코스닥 외인]</b>
+          1. 종목명 (순매수대금 / 등락률)
+          2. 종목명 (순매수대금 / 등락률)
+          3. 종목명 (순매수대금 / 등락률)
+          4. 종목명 (순매수대금 / 등락률)
+          5. 종목명 (순매수대금 / 등락률)
+
+          <b>[코스닥 기관]</b>
+          1. 종목명 (순매수대금 / 등락률)
+          2. 종목명 (순매수대금 / 등락률)
+          3. 종목명 (순매수대금 / 등락률)
+          4. 종목명 (순매수대금 / 등락률)
+          5. 종목명 (순매수대금 / 등락률)
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>3. 🔥 골든크로스 & 5일 수급 주도주 3선</b>
+
+          <b>■ 1. 종목명 (현재가 / 등락률)</b>
+          • <b>이평선:</b> 5일선 OOO원 / 20일선 OOO원
+          • <b>5일 누적:</b> 외인 OOO주 / 기관 OOO주
+          • <b>차트 팩트:</b> 단기 반등 모멘텀 실상 1줄
+          • <b>경계 라인:</b> 이탈 시 손절해야 하는 가격대 직설 경고
+
+          <b>■ 2. 종목명 (현재가 / 등락률)</b>
+          • <b>이평선:</b> 5일선 OOO원 / 20일선 OOO원
+          • <b>5일 누적:</b> 외인 OOO주 / 기관 OOO주
+          • <b>차트 팩트:</b> 단기 반등 모멘텀 실상 1줄
+          • <b>경계 라인:</b> 이탈 시 손절해야 하는 가격대 직설 경고
+
+          <b>■ 3. 종목명 (현재가 / 등락률)</b>
+          • <b>이평선:</b> 5일선 OOO원 / 20일선 OOO원
+          • <b>5일 누적:</b> 외인 OOO주 / 기관 OOO주
+          • <b>차트 팩트:</b> 단기 반등 모멘텀 실상 1줄
+          • <b>경계 라인:</b> 이탈 시 손절해야 하는 가격대 직설 경고
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>4. 💡 내일장 수급 경계령 & 체크포인트</b>
+
+          • 조심해야 할 윗꼬리 매물 및 페이크 수급 주의점 정리 (2줄 이내)
+          """
+
+          gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          report_text = None
+          max_retries = 3
+
+          for attempt in range(1, max_retries + 1):
+              print(f"2. Gemini AI 리포트 생성 중... (시도 {attempt}/{max_retries})")
+              try:
+                  g_res = requests.post(
+                      gemini_api_url,
+                      params={"key": gemini_key},
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps(payload),
+                      timeout=90
+                  )
+                  if g_res.status_code == 200:
+                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      break
+                  else:
+                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
+              except requests.exceptions.Timeout:
+                  print(f"응답 시간 초과 (시도 {attempt}/{max_retries})")
+              except Exception as e:
+                  print(f"Gemini 호출 오류: {e}")
+
+              if attempt < max_retries:
+                  time.sleep(3)
+
+          if not report_text:
+              print("❌ Gemini AI 리포트 생성 최종 실패")
+              sys.exit(1)
+
+          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
+
+          # -------------------------------------------------------------
+          # 3. 텔레그램 분할 및 안전 발송
+          # -------------------------------------------------------------
+          print("3. 텔레그램 메시지 발송 시작...")
+          tg_send_url = f"{tg_base_url}/sendMessage"
+
+          def send_to_telegram(msg_text):
+              chunks = [msg_text[i:i+3800] for i in range(0, len(msg_text), 3800)] if len(msg_text) > 3800 else [msg_text]
+              success = True
+
+              for idx, chunk in enumerate(chunks):
+                  res = requests.post(tg_send_url, json={
+                      "chat_id": chat_id,
+                      "text": chunk,
+                      "parse_mode": "HTML",
+                      "disable_web_page_preview": True
+                  }, timeout=15)
+
+                  if res.status_code == 200:
+                      print(f"[{idx+1}/{len(chunks)}] ✅ 텔레그램 HTML 발송 성공!")
+                  else:
+                      print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 ({res.status_code}): {res.text}")
+                      print("HTML 태그를 제거하고 일반 텍스트로 즉시 재발송합니다...")
+                      plain_chunk = re.sub(r'<[^>]+>', '', chunk)
+                      res_fallback = requests.post(tg_send_url, json={
+                          "chat_id": chat_id,
+                          "text": plain_chunk,
+                          "disable_web_page_preview": True
+                      }, timeout=15)
+
+                      if res_fallback.status_code == 200:
+                          print(f"[{idx+1}/{len(chunks)}] ✅ 텔레그램 일반 텍스트 발송 성공!")
+                      else:
+                          print(f"[{idx+1}/{len(chunks)}] ❌ 텔레그램 최종 실패 ({res_fallback.status_code}): {res_fallback.text}")
+                          success = False
+
+              return success
+
+          if not send_to_telegram(report_text):
+              print("❌ 에러: 텔레그램 메시지 전송 실패")
+              sys.exit(1)
+
+          print("🎉 기술적 3선 기반 냉혹한 수급 리포트 발송 성공 완료!")
+          EOF
+
+          python run_agent.py
