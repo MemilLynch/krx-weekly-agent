@@ -36,13 +36,13 @@ jobs:
           import pandas as pd
 
           # -------------------------------------------------------------
-          # [관심 종목 설정] 원하는 종목명과 6자리 종목코드
+          # [관심 종목 설정] 현대차 / 한국금융지주 / 파두 / 삼성SDI
           # -------------------------------------------------------------
           MY_WATCHLIST = {
-              "삼성전자": "005930",
-              "SK하이닉스": "000660",
               "현대차": "005380",
-              "NAVER": "035420"
+              "한국금융지주": "071050",
+              "파두": "440110",
+              "삼성SDI": "006400"
           }
 
           gemini_key = os.getenv("GEMINI_API_KEY")
@@ -228,80 +228,4 @@ jobs:
 
           <b>3. 🏆 시장별 순매수 TOP 5</b>
           • <b>[코스피 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
-          • <b>[코스피 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
-          • <b>[코스닥 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
-          • <b>[코스닥 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
-
-          <b>4. ⭐ 내 관심종목 5일 수급 집중 분석</b>
-          • 종목별로 당일 수급, 5일 누적 수급, 연속 순매수/매도 일수를 깔끔하게 정리하고 코멘트 작성
-
-          <b>5. 💡 내일장 관전 포인트</b>
-          • 수급 관점 핵심 체크 포인트
-          """
-
-          raw_api = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
-          api_endpoint = clean_url(raw_api)
-          payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
-          report_text = None
-          max_retries = 3
-
-          for attempt in range(1, max_retries + 1):
-              print(f"2. Gemini AI 리포트 생성 요청 중... (시도 {attempt}/{max_retries})")
-              try:
-                  g_res = requests.post(
-                      api_endpoint,
-                      params={"key": gemini_key},
-                      headers={"Content-Type": "application/json"},
-                      data=json.dumps(payload),
-                      timeout=90
-                  )
-                  if g_res.status_code == 200:
-                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                      break
-                  else:
-                      print(f"Gemini API 에러 (코드 {g_res.status_code}): {g_res.text}")
-              except requests.exceptions.Timeout:
-                  print(f"응답 시간 초과 (시도 {attempt}/{max_retries})")
-              except Exception as e:
-                  print(f"호출 오류 발생: {e}")
-
-              if attempt < max_retries:
-                  time.sleep(3)
-
-          if not report_text:
-              print("Gemini API 리포트 생성 최종 실패")
-              sys.exit(1)
-
-          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
-
-          # 3. 텔레그램 발송
-          print("3. 텔레그램 메시지 발송 중...")
-          raw_tg = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
-          tg_url = clean_url(raw_tg)
-
-          def send_telegram_html(text):
-              if len(text) <= 4000:
-                  res = requests.post(tg_url, json={
-                      "chat_id": chat_id,
-                      "text": text,
-                      "parse_mode": "HTML",
-                      "disable_web_page_preview": True
-                  })
-                  if res.status_code != 200:
-                      requests.post(tg_url, json={"chat_id": chat_id, "text": text})
-              else:
-                  chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
-                  for chunk in chunks:
-                      requests.post(tg_url, json={
-                          "chat_id": chat_id,
-                          "text": chunk,
-                          "parse_mode": "HTML",
-                          "disable_web_page_preview": True
-                      })
-
-          send_telegram_html(report_text)
-          print("🎉 시장 랭킹과 관심종목 5일 수급 리포트 발송 성공 완료!")
-          EOF
-
-          python run_agent.py
+          • <b>[코스피 기관]</b> 1위~5위 종목명 (순매수대
