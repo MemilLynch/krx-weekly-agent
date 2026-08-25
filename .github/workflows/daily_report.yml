@@ -27,6 +27,7 @@ jobs:
           cat << 'EOF' > run_agent.py
           import os
           import sys
+          import time
           import json
           import re
           import datetime
@@ -52,7 +53,6 @@ jobs:
               print("환경변수 오류: GitHub Secrets 3종을 확인하세요.")
               sys.exit(1)
 
-          # 복사 과정에서 섞일 수 있는 마크다운 하이퍼링크 문법 자동 정제 함수
           def clean_url(raw_url):
               match = re.search(r'https?://[^\s\)\]]+', str(raw_url))
               return match.group(0) if match else raw_url
@@ -192,8 +192,7 @@ jobs:
           today = datetime.datetime.now().strftime("%Y-%m-%d")
           print(f"수집 완료: 코스피 외인({len(df_kospi_foreign)}개), 기관({len(df_kospi_inst)}개), 코스닥 외인({len(df_kosdaq_foreign)}개), 기관({len(df_kosdaq_inst)}개), 관심종목({len(df_watchlist)}개)")
 
-          # 2. Gemini AI 리포트 생성
-          print("2. Gemini AI 종합 수급 분석 리포트 생성 중...")
+          # 2. Gemini AI 리포트 생성 (90초 타임아웃 및 최대 3회 재시도)
           prompt = f"""
           오늘({today}) 국내 증시 공식 수급 집계 데이터다:
 
@@ -243,20 +242,37 @@ jobs:
           raw_api = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
           api_endpoint = clean_url(raw_api)
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
-          
-          g_res = requests.post(
-              api_endpoint,
-              params={"key": gemini_key},
-              headers={"Content-Type": "application/json"},
-              data=json.dumps(payload),
-              timeout=30
-          )
 
-          if g_res.status_code != 200:
-              print(f"Gemini API 에러: {g_res.text}")
+          report_text = None
+          max_retries = 3
+
+          for attempt in range(1, max_retries + 1):
+              print(f"2. Gemini AI 리포트 생성 요청 중... (시도 {attempt}/{max_retries})")
+              try:
+                  g_res = requests.post(
+                      api_endpoint,
+                      params={"key": gemini_key},
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps(payload),
+                      timeout=90
+                  )
+                  if g_res.status_code == 200:
+                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      break
+                  else:
+                      print(f"Gemini API 에러 (코드 {g_res.status_code}): {g_res.text}")
+              except requests.exceptions.Timeout:
+                  print(f"응답 시간 초과 (시도 {attempt}/{max_retries})")
+              except Exception as e:
+                  print(f"호출 오류 발생: {e}")
+
+              if attempt < max_retries:
+                  time.sleep(3)
+
+          if not report_text:
+              print("Gemini API 리포트 생성 최종 실패")
               sys.exit(1)
 
-          report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
           report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
 
           # 3. 텔레그램 발송
