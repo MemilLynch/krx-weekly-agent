@@ -49,7 +49,6 @@ jobs:
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
           raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
 
-          # 환경변수 정제 (공백/따옴표 제거 및 bot 접두사 중복 보정)
           gemini_key = raw_gemini_key.strip().strip("'").strip('"')
           bot_token = raw_bot_token.strip().strip("'").strip('"')
           chat_id = raw_chat_id.strip().strip("'").strip('"')
@@ -61,14 +60,20 @@ jobs:
               print("환경변수 오류: GitHub Secrets 3종(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)을 확인하세요.")
               sys.exit(1)
 
+          # 마크다운 자동 링크 변환 원천 차단을 위한 URL 조합 정의
+          HTTP_SCHEME = "https://"
+          NAVER_DOMAIN = "finance.naver.com"
+          GEMINI_DOMAIN = "generativelanguage.googleapis.com"
+          TG_DOMAIN = "api.telegram.org"
+
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-              "Referer": "https://finance.naver.com/"
+              "Referer": f"{HTTP_SCHEME}{NAVER_DOMAIN}/"
           }
 
           # 1. 양대 시장 외인/기관 순위 수집
           def fetch_deal_rank(mkt_gb, investor_gubun, top_n=10):
-              url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
+              url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
               html_text = res.content.decode("cp949", errors="ignore")
 
@@ -123,7 +128,7 @@ jobs:
           def fetch_watchlist_5d_trend(watchlist_dict):
               res_list = []
               for name, code in watchlist_dict.items():
-                  url = f"https://finance.naver.com/item/frgn.naver?code={code}"
+                  url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/frgn.naver?code={code}"
                   res = requests.get(url, headers=headers, timeout=15)
                   soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
 
@@ -241,7 +246,7 @@ jobs:
           • 수급 관점 핵심 체크 포인트
           """
 
-          api_endpoint = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
+          gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
           report_text = None
@@ -251,7 +256,7 @@ jobs:
               print(f"2. Gemini AI 리포트 생성 중... (시도 {attempt}/{max_retries})")
               try:
                   g_res = requests.post(
-                      api_endpoint,
+                      gemini_api_url,
                       params={"key": gemini_key},
                       headers={"Content-Type": "application/json"},
                       data=json.dumps(payload),
@@ -278,7 +283,7 @@ jobs:
 
           # 3. 텔레그램 발송
           print("3. 텔레그램 메시지 발송 시작...")
-          tg_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
+          tg_url = f"{HTTP_SCHEME}{TG_DOMAIN}/bot{bot_token}/sendMessage"
 
           def send_to_telegram(msg_text):
               chunks = [msg_text[i:i+3800] for i in range(0, len(msg_text), 3800)] if len(msg_text) > 3800 else [msg_text]
