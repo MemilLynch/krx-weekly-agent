@@ -45,17 +45,21 @@ jobs:
               "삼성SDI": "006400"
           }
 
-          gemini_key = os.getenv("GEMINI_API_KEY")
-          bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-          chat_id = os.getenv("TELEGRAM_CHAT_ID")
+          raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
+          raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+
+          # 환경변수 정제 (공백/따옴표 제거 및 bot 접두사 중복 보정)
+          gemini_key = raw_gemini_key.strip().strip("'").strip('"')
+          bot_token = raw_bot_token.strip().strip("'").strip('"')
+          chat_id = raw_chat_id.strip().strip("'").strip('"')
+
+          if bot_token.lower().startswith("bot"):
+              bot_token = bot_token[3:]
 
           if not all([gemini_key, bot_token, chat_id]):
               print("환경변수 오류: GitHub Secrets 3종(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)을 확인하세요.")
               sys.exit(1)
-
-          def clean_url(raw_url):
-              match = re.search(r'https?://[^\s\)\]]+', str(raw_url))
-              return match.group(0) if match else raw_url
 
           headers = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -64,8 +68,7 @@ jobs:
 
           # 1. 양대 시장 외인/기관 순위 수집
           def fetch_deal_rank(mkt_gb, investor_gubun, top_n=10):
-              raw_url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
-              url = clean_url(raw_url)
+              url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
               html_text = res.content.decode("cp949", errors="ignore")
 
@@ -120,8 +123,7 @@ jobs:
           def fetch_watchlist_5d_trend(watchlist_dict):
               res_list = []
               for name, code in watchlist_dict.items():
-                  raw_url = f"https://finance.naver.com/item/frgn.naver?code={code}"
-                  url = clean_url(raw_url)
+                  url = f"https://finance.naver.com/item/frgn.naver?code={code}"
                   res = requests.get(url, headers=headers, timeout=15)
                   soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
 
@@ -239,8 +241,7 @@ jobs:
           • 수급 관점 핵심 체크 포인트
           """
 
-          raw_api = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
-          api_endpoint = clean_url(raw_api)
+          api_endpoint = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
           report_text = None
@@ -275,17 +276,15 @@ jobs:
 
           report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
 
-          # 3. 텔레그램 정밀 발송 및 에러 로깅
+          # 3. 텔레그램 발송
           print("3. 텔레그램 메시지 발송 시작...")
-          raw_tg = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
-          tg_url = clean_url(raw_tg)
+          tg_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
 
           def send_to_telegram(msg_text):
               chunks = [msg_text[i:i+3800] for i in range(0, len(msg_text), 3800)] if len(msg_text) > 3800 else [msg_text]
               success = True
 
               for idx, chunk in enumerate(chunks):
-                  # 1차 시도: HTML 서식 모드 전송
                   res = requests.post(tg_url, json={
                       "chat_id": chat_id,
                       "text": chunk,
@@ -296,10 +295,7 @@ jobs:
                   if res.status_code == 200:
                       print(f"[{idx+1}/{len(chunks)}] 텔레그램 HTML 발송 성공!")
                   else:
-                      print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 ({res.status_code}): {res.text}")
-                      print("태그를 제거하고 일반 텍스트로 재시도합니다...")
-                      
-                      # 2차 시도: 모든 HTML 태그를 제거한 순수 텍스트 전송 (파싱 에러 원천 방어)
+                      print(f"[{idx+1}/{len(chunks)}] HTML 모드 실패 ({res.status_code}) -> 일반 텍스트 재시도...")
                       plain_chunk = re.sub(r'<[^>]+>', '', chunk)
                       res_fallback = requests.post(tg_url, json={
                           "chat_id": chat_id,
@@ -310,13 +306,13 @@ jobs:
                       if res_fallback.status_code == 200:
                           print(f"[{idx+1}/{len(chunks)}] 텔레그램 일반 텍스트 발송 성공!")
                       else:
-                          print(f"[{idx+1}/{len(chunks)}] ❌ 텔레그램 발송 최종 실패 ({res_fallback.status_code}): {res_fallback.text}")
+                          print(f"[{idx+1}/{len(chunks)}] 텔레그램 발송 최종 실패 ({res_fallback.status_code}): {res_fallback.text}")
                           success = False
 
               return success
 
           if not send_to_telegram(report_text):
-              print("에러: 텔레그램 메시지 전송에 실패했습니다. 위의 텔레그램 에러 메시지를 확인하세요.")
+              print("에러: 텔레그램 전송 실패. 위의 상태 코드를 확인하세요.")
               sys.exit(1)
 
           print("🎉 현대차/한국금융지주/파두/삼성SDI 수급 리포트 발송 완료!")
