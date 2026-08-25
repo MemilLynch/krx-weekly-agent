@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 수급 수집 및 HTML 포맷 AI 리포트 발송
+      - name: 수급 수집 및 AI 리포트 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -57,46 +57,57 @@ jobs:
               "Referer": "https://finance.naver.com/"
           }
 
-          # 1. 양대 시장 외인/기관 순위 수집
+          # 1. 양대 시장 외인/기관 순위 수집 (검증된 정규식 토큰 파서)
           def fetch_deal_rank(mkt_gb, investor_gubun, top_n=10):
               url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
-              soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
+              html_text = res.content.decode("cp949", errors="ignore")
+
+              pattern = r'href=["\'][^"\']*code=(\d{6})["\'][^>]*>([^<]+)</a>'
+              matches = list(re.finditer(pattern, html_text, re.IGNORECASE))
 
               data_list = []
-              rank = 1
-              for tr in soup.find_all("tr"):
-                  a_tag = tr.find("a", href=re.compile(r"code=\d{6}"))
-                  if not a_tag:
-                      continue
-                  name = a_tag.get_text(strip=True)
+              for i, match in enumerate(matches):
+                  if len(data_list) >= top_n:
+                      break
+
+                  code = match.group(1)
+                  name = match.group(2).strip()
                   if not name:
                       continue
 
-                  tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                  if len(tds) >= 7:
-                      cur_price = tds[2]
-                      rate = tds[4]
-                      volume = tds[5]
-                      raw_amt = tds[6]
+                  start = match.end()
+                  end = matches[i + 1].start() if i + 1 < len(matches) else start + 1500
+                  chunk = html_text[start:end]
 
-                      clean_amt = re.sub(r'[^\d.]', '', raw_amt)
+                  clean_chunk = re.sub(r'<[^>]+>', ' ', chunk).replace('&nbsp;', ' ')
+                  tokens = [t.strip() for t in clean_chunk.split() if t.strip()]
+
+                  cur_price = tokens[0] if len(tokens) > 0 else "-"
+                  rate = next((t for t in tokens if "%" in t), "-")
+                  num_tokens = [t for t in tokens if re.search(r'\d', t) and "%" not in t]
+
+                  volume = num_tokens[-2] if len(num_tokens) >= 3 else (tokens[3] if len(tokens) > 3 else "-")
+                  raw_amt = num_tokens[-1] if len(num_tokens) >= 2 else (tokens[-1] if tokens else "-")
+
+                  clean_amt = re.sub(r'[^\d.]', '', raw_amt)
+                  if clean_amt:
                       try:
-                          amt_100m = f"{round(float(clean_amt) / 100, 1):,}억" if clean_amt else raw_amt
-                      except:
+                          amt_100m = f"{round(float(clean_amt) / 100, 1):,}억"
+                      except Exception:
                           amt_100m = raw_amt
+                  else:
+                      amt_100m = raw_amt
 
-                      data_list.append({
-                          "순위": rank,
-                          "종목명": name,
-                          "현재가": cur_price,
-                          "등락률": rate,
-                          "순매수대금": amt_100m,
-                          "순매수거래량": volume
-                      })
-                      rank += 1
-                      if rank > top_n:
-                          break
+                  data_list.append({
+                      "순위": len(data_list) + 1,
+                      "종목명": name,
+                      "종목코드": code,
+                      "현재가": cur_price,
+                      "등락률": rate,
+                      "순매수거래량": volume,
+                      "순매수대금": amt_100m
+                  })
               return pd.DataFrame(data_list)
 
           # 2. 관심 종목 최근 5영업일 수급 누적 및 연속성 계산
@@ -172,12 +183,12 @@ jobs:
           df_watchlist = fetch_watchlist_5d_trend(MY_WATCHLIST)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print("수집 완료: 시장 데이터 정제 완료")
+          print(f"수집 완료: 코스피 외인({len(df_kospi_foreign)}개), 기관({len(df_kospi_inst)}개), 코스닥 외인({len(df_kosdaq_foreign)}개), 기관({len(df_kosdaq_inst)}개), 관심종목({len(df_watchlist)}개)")
 
-          # 2. Gemini AI 리포트 생성 (Telegram HTML 규격 강제)
-          print("2. Gemini AI 분석 리포트(HTML 포맷) 생성 중...")
+          # 2. Gemini AI 리포트 생성 (일반 텍스트 및 <b> 태그만 사용)
+          print("2. Gemini AI 종합 수급 분석 리포트 생성 중...")
           prompt = f"""
-          오늘({today}) 국내 증시 공식 수급 데이터다:
+          오늘({today}) 국내 증시 공식 수급 집계 데이터다:
 
           [코스피 외국인 순매수 TOP 10]
           {df_kospi_foreign.to_string(index=False)}
@@ -191,38 +202,38 @@ jobs:
           [코스닥 기관 순매수 TOP 10]
           {df_kosdaq_inst.to_string(index=False)}
 
-          [관심종목 5일 수급 현황]
+          [⭐ 내 관심종목 5일 수급 현황]
           {df_watchlist.to_string(index=False)}
 
-          [★ 필수 서식 지침 - 어기면 파싱 오류 발생 ★]
-          1. 텔레그램 모바일용 리포트이므로 마크다운 표(|---|)나 마크다운 볼드(**)를 절대 쓰지 마라.
-          2. 볼드체는 반드시 HTML 태그인 <b>제목 및 강조텍스트</b> 를 사용해라.
-          3. 숫자, 종목코드, 등락률 등 데이터는 <code>75,000원 (+1.5%)</code> 처럼 <code> 태그를 적절히 감싸라.
-          4. 꺾쇠 괄호는 오직 <b>, </b>, <code>, </code> 만 허용되며 <5일> 같은 텍스트용 꺾쇠는 쓰지 마라.
+          [★ 필수 서식 규칙 ★]
+          1. <code> 태그 및 백틱(```)은 절대 사용하지 마라. (터치 시 복사되는 보라색 박스 방지)
+          2. 마크다운 표(|---|)나 마크다운 볼드(**)를 쓰지 마라.
+          3. 강조하고 싶은 제목과 핵심 단어는 오직 <b>텍스트</b> 태그만 사용해라.
+          4. 숫자와 가격, 등락률은 일반 글자로 작성해라. (예: 75,000원 (+1.5%))
 
-          [작성 구조]
+          [출력 템플릿]
           <b>📊 [{today}] 코스피·코스닥 수급 및 관심종목 종합 브리핑</b>
 
           <b>1. 📌 오늘 시장 핵심 요약</b>
-          • 1~2줄 핵심 수급 요약
+          • 1~2줄 핵심 요약
 
           <b>2. 🔥 외인·기관 쌍끌이 순매수 및 주도 섹터</b>
-          • 양대 시장 공통 매수 유입 특징 및 핵심 주도 섹터 정리
+          • 양대 시장 공통 매수 특징 및 핵심 섹터 분석
 
-          <b>3. 🏆 시장별 순매수 TOP 5 리스트</b>
+          <b>3. 🏆 시장별 순매수 TOP 5</b>
           • <b>[코스피 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
           • <b>[코스피 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
           • <b>[코스닥 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
           • <b>[코스닥 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
 
           <b>4. ⭐ 내 관심종목 5일 수급 집중 분석</b>
-          • 종목별로 당일 수급, 5일 누적 수급, 연속 순매수/순매도 일수를 깔끔한 불릿으로 정리하고 코멘트 작성
+          • 종목별로 당일 수급, 5일 누적 수급, 연속 순매수/매도 일수를 깔끔하게 정리하고 코멘트 작성
 
           <b>5. 💡 내일장 관전 포인트</b>
-          • 수급 관점에서의 핵심 체크 포인트
+          • 수급 관점 핵심 체크 포인트
           """
 
-          g_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={gemini_key}"
+          g_url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=){gemini_key}"
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
           g_res = requests.post(g_url, headers={"Content-Type": "application/json"}, data=json.dumps(payload))
 
@@ -231,13 +242,11 @@ jobs:
               sys.exit(1)
 
           report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
 
-          # 마크다운 잔재 방어 정제
-          report_text = report_text.replace("```html", "").replace("```", "").strip()
-
-          # 3. 텔레그램 HTML 모드 발송
-          print("3. 텔레그램 HTML 발송 중...")
-          tg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+          # 3. 텔레그램 발송
+          print("3. 텔레그램 메시지 발송 중...")
+          tg_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
 
           def send_telegram_html(text):
               if len(text) <= 4000:
@@ -248,7 +257,6 @@ jobs:
                       "disable_web_page_preview": True
                   })
                   if res.status_code != 200:
-                      # HTML 파싱 실패 시 일반 텍스트 모드로 안전 재발송
                       requests.post(tg_url, json={"chat_id": chat_id, "text": text})
               else:
                   chunks = [text[i:i+3800] for i in range(0, len(text), 3800)]
@@ -261,7 +269,7 @@ jobs:
                       })
 
           send_telegram_html(report_text)
-          print("🎉 깔끔하게 포맷팅된 텔레그램 발송 완료!")
+          print("🎉 시장 랭킹과 관심종목 수급 발송 완료!")
           EOF
 
           python run_agent.py
