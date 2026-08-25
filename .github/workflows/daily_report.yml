@@ -50,7 +50,7 @@ jobs:
           chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
           if not all([gemini_key, bot_token, chat_id]):
-              print("환경변수 오류: GitHub Secrets 3종을 확인하세요.")
+              print("환경변수 오류: GitHub Secrets 3종(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)을 확인하세요.")
               sys.exit(1)
 
           def clean_url(raw_url):
@@ -192,7 +192,7 @@ jobs:
           today = datetime.datetime.now().strftime("%Y-%m-%d")
           print(f"수집 완료: 코스피 외인({len(df_kospi_foreign)}개), 기관({len(df_kospi_inst)}개), 코스닥 외인({len(df_kosdaq_foreign)}개), 기관({len(df_kosdaq_inst)}개), 관심종목({len(df_watchlist)}개)")
 
-          # 2. Gemini AI 리포트 생성 (90초 타임아웃 및 최대 3회 재시도)
+          # 2. Gemini AI 리포트 생성
           prompt = f"""
           오늘({today}) 국내 증시 공식 수급 집계 데이터다:
 
@@ -212,10 +212,10 @@ jobs:
           {df_watchlist.to_string(index=False)}
 
           [★ 필수 서식 규칙 ★]
-          1. <code> 태그 및 백틱(```)은 절대 사용 금지. (보라색 복사 박스 방지)
+          1. <code> 태그 및 백틱(```)은 절대 사용하지 마라.
           2. 마크다운 표(|---|)나 마크다운 볼드(**)를 쓰지 마라.
-          3. 강조하고 싶은 제목과 핵심 단어는 오직 <b>텍스트</b> 태그만 사용해라.
-          4. 숫자와 가격, 등락률은 일반 글자로 작성해라. (예: 75,000원 (+1.5%))
+          3. 강조 제목과 핵심 단어는 오직 <b>텍스트</b> 태그만 사용해라.
+          4. 본문에 <, > 꺾쇠 기호를 절대 단독으로 쓰지 마라. (텔레그램 HTML 오류 방지)
 
           [출력 템플릿]
           <b>📊 [{today}] 코스피·코스닥 수급 및 관심종목 종합 브리핑</b>
@@ -228,4 +228,98 @@ jobs:
 
           <b>3. 🏆 시장별 순매수 TOP 5</b>
           • <b>[코스피 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
-          • <b>[코스피 기관]</b> 1위~5위 종목명 (순매수대
+          • <b>[코스피 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
+          • <b>[코스닥 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
+          • <b>[코스닥 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
+
+          <b>4. ⭐ 내 관심종목 5일 수급 집중 분석</b>
+          • 종목별로 당일 수급, 5일 누적 수급, 연속 순매수/매도 일수를 깔끔하게 정리하고 코멘트 작성
+
+          <b>5. 💡 내일장 관전 포인트</b>
+          • 수급 관점 핵심 체크 포인트
+          """
+
+          raw_api = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent)"
+          api_endpoint = clean_url(raw_api)
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          report_text = None
+          max_retries = 3
+
+          for attempt in range(1, max_retries + 1):
+              print(f"2. Gemini AI 리포트 생성 중... (시도 {attempt}/{max_retries})")
+              try:
+                  g_res = requests.post(
+                      api_endpoint,
+                      params={"key": gemini_key},
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps(payload),
+                      timeout=90
+                  )
+                  if g_res.status_code == 200:
+                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      break
+                  else:
+                      print(f"Gemini API 응답 오류 ({g_res.status_code}): {g_res.text}")
+              except requests.exceptions.Timeout:
+                  print(f"응답 시간 초과 (시도 {attempt}/{max_retries})")
+              except Exception as e:
+                  print(f"Gemini 호출 예외 발생: {e}")
+
+              if attempt < max_retries:
+                  time.sleep(3)
+
+          if not report_text:
+              print("Gemini API 리포트 생성 실패")
+              sys.exit(1)
+
+          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
+
+          # 3. 텔레그램 정밀 발송 및 에러 로깅
+          print("3. 텔레그램 메시지 발송 시작...")
+          raw_tg = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){bot_token}/sendMessage"
+          tg_url = clean_url(raw_tg)
+
+          def send_to_telegram(msg_text):
+              chunks = [msg_text[i:i+3800] for i in range(0, len(msg_text), 3800)] if len(msg_text) > 3800 else [msg_text]
+              success = True
+
+              for idx, chunk in enumerate(chunks):
+                  # 1차 시도: HTML 서식 모드 전송
+                  res = requests.post(tg_url, json={
+                      "chat_id": chat_id,
+                      "text": chunk,
+                      "parse_mode": "HTML",
+                      "disable_web_page_preview": True
+                  }, timeout=15)
+
+                  if res.status_code == 200:
+                      print(f"[{idx+1}/{len(chunks)}] 텔레그램 HTML 발송 성공!")
+                  else:
+                      print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 ({res.status_code}): {res.text}")
+                      print("태그를 제거하고 일반 텍스트로 재시도합니다...")
+                      
+                      # 2차 시도: 모든 HTML 태그를 제거한 순수 텍스트 전송 (파싱 에러 원천 방어)
+                      plain_chunk = re.sub(r'<[^>]+>', '', chunk)
+                      res_fallback = requests.post(tg_url, json={
+                          "chat_id": chat_id,
+                          "text": plain_chunk,
+                          "disable_web_page_preview": True
+                      }, timeout=15)
+
+                      if res_fallback.status_code == 200:
+                          print(f"[{idx+1}/{len(chunks)}] 텔레그램 일반 텍스트 발송 성공!")
+                      else:
+                          print(f"[{idx+1}/{len(chunks)}] ❌ 텔레그램 발송 최종 실패 ({res_fallback.status_code}): {res_fallback.text}")
+                          success = False
+
+              return success
+
+          if not send_to_telegram(report_text):
+              print("에러: 텔레그램 메시지 전송에 실패했습니다. 위의 텔레그램 에러 메시지를 확인하세요.")
+              sys.exit(1)
+
+          print("🎉 현대차/한국금융지주/파두/삼성SDI 수급 리포트 발송 완료!")
+          EOF
+
+          python run_agent.py
