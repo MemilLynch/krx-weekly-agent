@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 수급 수집 및 AI 리포트 발송
+      - name: 수급 수집 및 정밀 스크리닝 AI 리포트 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -35,16 +35,6 @@ jobs:
           from bs4 import BeautifulSoup
           import pandas as pd
 
-          # -------------------------------------------------------------
-          # [관심 종목 설정] 현대차 / 한국금융지주 / 파두 / 삼성SDI
-          # -------------------------------------------------------------
-          MY_WATCHLIST = {
-              "현대차": "005380",
-              "한국금융지주": "071050",
-              "파두": "440110",
-              "삼성SDI": "006400"
-          }
-
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
           raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -57,10 +47,9 @@ jobs:
               bot_token = bot_token[3:]
 
           if not all([gemini_key, bot_token, chat_id]):
-              print("환경변수 오류: GitHub Secrets 3종(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)을 확인하세요.")
+              print("환경변수 오류: GitHub Secrets 3종을 확인하세요.")
               sys.exit(1)
 
-          # 마크다운 자동 링크 변환 원천 차단을 위한 URL 조합 정의
           HTTP_SCHEME = "https://"
           NAVER_DOMAIN = "finance.naver.com"
           GEMINI_DOMAIN = "generativelanguage.googleapis.com"
@@ -71,7 +60,7 @@ jobs:
               "Referer": f"{HTTP_SCHEME}{NAVER_DOMAIN}/"
           }
 
-          # 1. 양대 시장 외인/기관 순위 수집
+          # 1. 양대 시장 외인/기관 당일 상위 10개 종목 수집
           def fetch_deal_rank(mkt_gb, investor_gubun, top_n=10):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
@@ -105,13 +94,7 @@ jobs:
                   raw_amt = num_tokens[-1] if len(num_tokens) >= 2 else (tokens[-1] if tokens else "-")
 
                   clean_amt = re.sub(r'[^\d.]', '', raw_amt)
-                  if clean_amt:
-                      try:
-                          amt_100m = f"{round(float(clean_amt) / 100, 1):,}억"
-                      except Exception:
-                          amt_100m = raw_amt
-                  else:
-                      amt_100m = raw_amt
+                  amt_100m = f"{round(float(clean_amt) / 100, 1):,}억" if clean_amt else raw_amt
 
                   data_list.append({
                       "순위": len(data_list) + 1,
@@ -124,84 +107,86 @@ jobs:
                   })
               return pd.DataFrame(data_list)
 
-          # 2. 관심 종목 최근 5영업일 수급 누적 및 연속성 계산
-          def fetch_watchlist_5d_trend(watchlist_dict):
-              res_list = []
-              for name, code in watchlist_dict.items():
+          # 2. 상위 후보 종목 20일 시세 기반 [5일선 > 20일선 & 5일 외인/기관 누적 매집] 정밀 스크리닝
+          def screen_technical_top3(candidate_dict):
+              screened = []
+              for name, code in candidate_dict.items():
                   url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/frgn.naver?code={code}"
                   res = requests.get(url, headers=headers, timeout=15)
                   soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
 
-                  daily_rows = []
+                  daily_data = []
                   for tr in soup.find_all("tr"):
                       tds = [td.get_text(strip=True) for td in tr.find_all("td")]
                       if len(tds) >= 7 and re.match(r'^\d{4}\.\d{2}\.\d{2}$', tds[0]):
                           try:
-                              inst_num = int(tds[5].replace(",", "").replace("+", ""))
+                              close_p = int(tds[1].replace(",", ""))
+                              inst_v = int(tds[5].replace(",", "").replace("+", ""))
+                              frgn_v = int(tds[6].replace(",", "").replace("+", ""))
+                              daily_data.append({
+                                  "price": close_p,
+                                  "rate": tds[3],
+                                  "inst": inst_v,
+                                  "frgn": frgn_v
+                              })
                           except:
-                              inst_num = 0
-                          try:
-                              frgn_num = int(tds[6].replace(",", "").replace("+", ""))
-                          except:
-                              frgn_num = 0
-
-                          daily_rows.append({
-                              "date": tds[0],
-                              "price": tds[1],
-                              "rate": tds[3],
-                              "inst": inst_num,
-                              "frgn": frgn_num,
-                              "inst_str": tds[5],
-                              "frgn_str": tds[6]
-                          })
-                          if len(daily_rows) >= 5:
+                              continue
+                          if len(daily_data) >= 20:
                               break
 
-                  if daily_rows:
-                      today_data = daily_rows[0]
-                      inst_5d_sum = sum(r["inst"] for r in daily_rows)
-                      frgn_5d_sum = sum(r["frgn"] for r in daily_rows)
+                  if len(daily_data) >= 20:
+                      prices = [d["price"] for d in daily_data]
+                      ma5 = sum(prices[:5]) / 5.0
+                      ma20 = sum(prices[:20]) / 20.0
+                      cur_price = prices[0]
 
-                      def get_streak(rows, key):
-                          if not rows or rows[0][key] == 0:
-                              return "보합"
-                          target_sign = 1 if rows[0][key] > 0 else -1
-                          streak = 0
-                          for r in rows:
-                              sign = 1 if r[key] > 0 else (-1 if r[key] < 0 else 0)
-                              if sign == target_sign:
-                                  streak += 1
-                              else:
-                                  break
-                          action = "연속 매수" if target_sign > 0 else "연속 매도"
-                          return f"{streak}일 {action}"
+                      sum_5d_inst = sum(d["inst"] for d in daily_data[:5])
+                      sum_5d_frgn = sum(d["frgn"] for d in daily_data[:5])
+                      total_5d_flow = sum_5d_inst + sum_5d_frgn
 
-                      res_list.append({
-                          "종목명": name,
-                          "현재가": today_data["price"],
-                          "등락률": today_data["rate"],
-                          "당일 외인": today_data["frgn_str"],
-                          "당일 기관": today_data["inst_str"],
-                          "5일 누적 외인": f"{frgn_5d_sum:+,}주",
-                          "외인 연속성": get_streak(daily_rows, "frgn"),
-                          "5일 누적 기관": f"{inst_5d_sum:+,}주",
-                          "기관 연속성": get_streak(daily_rows, "inst")
-                      })
-              return pd.DataFrame(res_list)
+                      # 조건: 주가가 5일선 위에 있고, 5일선이 20일선 위에 위치(골든크로스/단기정배열)
+                      if cur_price >= ma5 and ma5 > ma20 and total_5d_flow > 0:
+                          screened.append({
+                              "종목명": name,
+                              "종목코드": code,
+                              "현재가": f"{cur_price:,}원",
+                              "등락률": daily_data[0]["rate"],
+                              "5일선": f"{int(ma5):,}원",
+                              "20일선": f"{int(ma20):,}원",
+                              "5일누적외인": f"{sum_5d_frgn:+,}주",
+                              "5일누적기관": f"{sum_5d_inst:+,}주",
+                              "5일누적합산수급": total_5d_flow
+                          })
 
-          print("1. 양대 시장 랭킹 및 관심종목 5일 수급 데이터 수집 중...")
+              # 5일간 외인+기관 합산 순매수량이 가장 강력한 상위 딱 3종목 선별
+              screened = sorted(screened, key=lambda x: x["5일누적합산수급"], reverse=True)
+              top3 = screened[:3]
+              for item in top3:
+                  del item["5일누적합산수급"]
+              return pd.DataFrame(top3)
+
+          print("1. 양대 시장 랭킹 수집 및 기술적 3종목 스크리닝 중...")
           df_kospi_foreign = fetch_deal_rank(mkt_gb=1, investor_gubun=9000, top_n=10)
           df_kospi_inst = fetch_deal_rank(mkt_gb=1, investor_gubun=1000, top_n=10)
           df_kosdaq_foreign = fetch_deal_rank(mkt_gb=2, investor_gubun=9000, top_n=10)
           df_kosdaq_inst = fetch_deal_rank(mkt_gb=2, investor_gubun=1000, top_n=10)
-          df_watchlist = fetch_watchlist_5d_trend(MY_WATCHLIST)
 
+          # 후보군 추출: 상위 순매수 종목들 중 중복 제거
+          all_candidates = {}
+          for df in [df_kospi_foreign, df_kospi_inst, df_kosdaq_foreign, df_kosdaq_inst]:
+              if not df.empty:
+                  for _, r in df.iterrows():
+                      # ETF/ETN 제외하고 개별주 위주 압축
+                      if not any(k in r["종목명"] for k in ["TIGER", "KODEX", "ACE", "RISE", "레버리지", "인버스"]):
+                          all_candidates[r["종목명"]] = r["종목코드"]
+
+          df_top3_screened = screen_technical_top3(all_candidates)
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"수집 완료: 코스피 외인({len(df_kospi_foreign)}개), 기관({len(df_kospi_inst)}개), 코스닥 외인({len(df_kosdaq_foreign)}개), 기관({len(df_kosdaq_inst)}개), 관심종목({len(df_watchlist)}개)")
+          print(f"스크리닝 완료: 조건 만족 종목 {len(df_top3_screened)}개 선별")
 
-          # 2. Gemini AI 리포트 생성
+          # 2. Gemini AI 냉혹한 수급 리포트 생성
           prompt = f"""
-          오늘({today}) 국내 증시 공식 수급 집계 데이터다:
+          오늘({today}) 국내 증시 공식 수급 데이터 및 기술적 필터링 결과다:
 
           [코스피 외국인 순매수 TOP 10]
           {df_kospi_foreign.to_string(index=False)}
@@ -215,35 +200,36 @@ jobs:
           [코스닥 기관 순매수 TOP 10]
           {df_kosdaq_inst.to_string(index=False)}
 
-          [⭐ 내 관심종목 5일 수급 현황]
-          {df_watchlist.to_string(index=False)}
+          [🔥 기술적 스크리닝 선정 3종목 (5일선>20일선 정배열 & 5일간 외인/기관 순매수 상위 & 현재가>5일선)]
+          {df_top3_screened.to_string(index=False)}
 
-          [★ 필수 서식 규칙 ★]
-          1. <code> 태그 및 백틱(```)은 절대 사용하지 마라.
-          2. 마크다운 표(|---|)나 마크다운 볼드(**)를 쓰지 마라.
-          3. 강조 제목과 핵심 단어는 오직 <b>텍스트</b> 태그만 사용해라.
-          4. 본문에 <, > 꺾쇠 기호를 절대 단독으로 쓰지 마라. (텔레그램 HTML 오류 방지)
+          [★ 리포트 작성 철칙 - 극도로 중요 ★]
+          1. 절대 맹목적으로 낙관적(Bullish)이거나 장밋빛 희망회로를 돌리지 마라.
+          2. 수급이 꼬였거나, 윗꼬리를 달았거나, 외인/기관이 단타성으로 털고 나간 종목(설거지), 하방 압력이 높은 주식은 '수급 이탈', '단기 고점 징후', '매물대 폭탄 주의' 등 냉정하고 거칠게 리스크를 비판해라.
+          3. <code> 태그 및 백틱(```)은 절대 사용 금지. (보라색 복사 박스 방지)
+          4. 마크다운 표(|---|)나 마크다운 볼드(**)를 쓰지 말고, 오직 <b>제목 및 강조텍스트</b> 태그만 써라.
+          5. 단독 < 또는 > 기호는 절대 쓰지 마라. (텔레그램 HTML 파싱 오류 방지)
 
           [출력 템플릿]
-          <b>📊 [{today}] 코스피·코스닥 수급 및 관심종목 종합 브리핑</b>
+          <b>📊 [{today}] 코스피·코스닥 수급 팩트 체크 & 기술적 주도주 3선</b>
 
-          <b>1. 📌 오늘 시장 핵심 요약</b>
-          • 1~2줄 핵심 요약
+          <b>1. 📌 오늘 시장 수급 실상 (가식 없는 냉혹한 평가)</b>
+          • 1~2줄로 시장의 진짜 수급 왜곡, 쏠림, 하방 리스크를 가감 없이 직설 서술
 
-          <b>2. 🔥 외인·기관 쌍끌이 순매수 및 주도 섹터</b>
-          • 양대 시장 공통 매수 특징 및 핵심 섹터 분석
-
-          <b>3. 🏆 시장별 순매수 TOP 5</b>
+          <b>2. 🏆 시장별 순매수 TOP 5 팩트 리스트</b>
           • <b>[코스피 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
           • <b>[코스피 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
           • <b>[코스닥 외인]</b> 1위~5위 종목명 (순매수대금 / 등락률)
           • <b>[코스닥 기관]</b> 1위~5위 종목명 (순매수대금 / 등락률)
 
-          <b>4. ⭐ 내 관심종목 5일 수급 집중 분석</b>
-          • 종목별로 당일 수급, 5일 누적 수급, 연속 순매수/매도 일수를 깔끔하게 정리하고 코멘트 작성
+          <b>3. 🔥 [골든크로스 & 5일 누적 수급 최상위 정배열 3선]</b>
+          • <b>선정된 3개 종목 각각에 대해:</b>
+            - 종목명 (현재가 / 등락률 / 5일선 / 20일선)
+            - 5일간 외인/기관 누적 수급 수치
+            - <b>냉정한 기술적 분석 및 리스크 진단:</b> 왜 이 종목이 차트상 살아있는지, 반대로 어디가 깨지면 즉시 손절/이탈해야 하는지 지지선/저항선 관점에서 냉정하게 코멘트
 
-          <b>5. 💡 내일장 관전 포인트</b>
-          • 수급 관점 핵심 체크 포인트
+          <b>4. 💡 내일장 수급 경계령 및 체크포인트</b>
+          • 조심해야 할 페이크 수급 및 주도 섹터 지속 여부
           """
 
           gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
@@ -253,7 +239,7 @@ jobs:
           max_retries = 3
 
           for attempt in range(1, max_retries + 1):
-              print(f"2. Gemini AI 리포트 생성 중... (시도 {attempt}/{max_retries})")
+              print(f"2. Gemini AI 분석 리포트 생성 중... (시도 {attempt}/{max_retries})")
               try:
                   g_res = requests.post(
                       gemini_api_url,
@@ -266,11 +252,11 @@ jobs:
                       report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
                       break
                   else:
-                      print(f"Gemini API 응답 오류 ({g_res.status_code}): {g_res.text}")
+                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
               except requests.exceptions.Timeout:
                   print(f"응답 시간 초과 (시도 {attempt}/{max_retries})")
               except Exception as e:
-                  print(f"Gemini 호출 예외 발생: {e}")
+                  print(f"Gemini 예외 발생: {e}")
 
               if attempt < max_retries:
                   time.sleep(3)
@@ -317,10 +303,10 @@ jobs:
               return success
 
           if not send_to_telegram(report_text):
-              print("에러: 텔레그램 전송 실패. 위의 상태 코드를 확인하세요.")
+              print("에러: 텔레그램 발송 실패")
               sys.exit(1)
 
-          print("🎉 현대차/한국금융지주/파두/삼성SDI 수급 리포트 발송 완료!")
+          print("🎉 기술적 3선 기반 냉혹한 수급 리포트 발송 완료!")
           EOF
 
           python run_agent.py
