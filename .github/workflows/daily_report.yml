@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 수급 수집 및 고가독성 리포트 발송
+      - name: 수급 수집 및 MemilLynch 채널 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -36,21 +36,25 @@ jobs:
           import pandas as pd
 
           # -------------------------------------------------------------
-          # 0. 환경변수 정제 및 텔레그램 봇 사전 검증
+          # 0. 전송 대상 채널 설정 (@MemilLynch)
           # -------------------------------------------------------------
+          TARGET_CHANNEL = "@MemilLynch"
+
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
           raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
 
           gemini_key = raw_gemini_key.strip().strip("'").strip('"')
           bot_token = raw_bot_token.strip().strip("'").strip('"')
-          chat_id = raw_chat_id.strip().strip("'").strip('"')
+          
+          # 채널 아이디 우선 적용 (지정된 채널 또는 Secrets 값)
+          chat_id = TARGET_CHANNEL if TARGET_CHANNEL else raw_chat_id.strip().strip("'").strip('"')
 
           if bot_token.lower().startswith("bot"):
               bot_token = bot_token[3:]
 
-          if not all([gemini_key, bot_token, chat_id]):
-              print("❌ 환경변수 오류: GitHub Secrets 3종(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)을 확인하세요.")
+          if not gemini_key or not bot_token:
+              print("❌ 환경변수 오류: GEMINI_API_KEY 또는 TELEGRAM_BOT_TOKEN이 누락되었습니다.")
               sys.exit(1)
 
           HTTP_SCHEME = "https://"
@@ -60,15 +64,14 @@ jobs:
 
           tg_base_url = f"{HTTP_SCHEME}{TG_DOMAIN}/bot{bot_token}"
 
-          print("0. 텔레그램 봇 연결 상태 사전 확인 중...")
+          print(f"0. 텔레그램 봇 상태 확인 중 (발송 대상 채널: {chat_id})...")
           try:
               chk = requests.get(f"{tg_base_url}/getMe", timeout=10)
               if chk.status_code == 200 and chk.json().get("ok"):
                   bot_name = chk.json()["result"].get("username", "UnknownBot")
-                  print(f"✅ 텔레그램 봇 정상 확인: @{bot_name}")
+                  print(f"✅ 텔레그램 봇 정상 연결: @{bot_name}")
               else:
-                  print(f"❌ 텔레그램 토큰 오류 (코드 {chk.status_code}): {chk.text}")
-                  print("GitHub Secrets의 TELEGRAM_BOT_TOKEN 값을 다시 확인해주세요.")
+                  print(f"❌ 텔레그램 토큰 오류 ({chk.status_code}): {chk.text}")
                   sys.exit(1)
           except Exception as e:
               print(f"❌ 텔레그램 서버 통신 실패: {e}")
@@ -168,7 +171,6 @@ jobs:
                       sum_5d_frgn = sum(d["frgn"] for d in daily_data[:5])
                       total_5d_flow = sum_5d_inst + sum_5d_frgn
 
-                      # 골든크로스/단기정배열 및 주가가 5일선 위에 안착한 종목
                       if cur_price >= ma5 and ma5 >= ma20:
                           screened.append({
                               "종목명": name,
@@ -188,7 +190,7 @@ jobs:
                   del item["5일누적합산수급"]
               return pd.DataFrame(top3)
 
-          print("1. 양대 시장 랭킹 및 기술적 3종목 스크리닝 중...")
+          print("1. 수급 순위 수집 및 기술적 3선 스크리닝 중...")
           df_kospi_foreign = fetch_deal_rank(mkt_gb=1, investor_gubun=9000, top_n=10)
           df_kospi_inst = fetch_deal_rank(mkt_gb=1, investor_gubun=1000, top_n=10)
           df_kosdaq_foreign = fetch_deal_rank(mkt_gb=2, investor_gubun=9000, top_n=10)
@@ -203,10 +205,10 @@ jobs:
 
           df_top3_screened = screen_technical_top3(all_candidates)
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"수집 완료: 기술적 필터링 통과 {len(df_top3_screened)}종목 선별")
+          print(f"스크리닝 완료: 기술적 조건 만족 {len(df_top3_screened)}개 종목 선별")
 
           # -------------------------------------------------------------
-          # 2. Gemini AI 냉혹한 수급 팩트 리포트 생성
+          # 2. Gemini AI 고가독성 리포트 생성 (가식 없는 냉혹한 평가)
           # -------------------------------------------------------------
           prompt = f"""
           오늘({today}) 국내 증시 공식 수급 데이터 및 기술적 필터링 결과다:
@@ -223,17 +225,17 @@ jobs:
           [코스닥 기관 순매수 TOP 10]
           {df_kosdaq_inst.to_string(index=False)}
 
-          [🔥 기술적 스크리닝 통과 3종목 (5일선>=20일선 & 주가>=5일선 & 5일 수급 상위)]
+          [🔥 기술적 스크리닝 3종목 (5일선>=20일선 & 주가>=5일선 & 5일 수급 상위)]
           {df_top3_screened.to_string(index=False)}
 
-          [★ 핵심 작성 원칙 - 가독성 및 톤앤매너 ★]
-          1. 텔레그램 모바일 화면에서 한눈에 깔끔히 보이도록 섹션, 종목 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣어라.
-          2. 절대 맹목적인 장밋빛 상승론(Bullish)을 펼치지 마라. 수급이 꼬였거나 외인/기관이 단타로 털고 나간 종목(설거지)은 '단기 고점 징후', '윗꼬리 폭탄 주의', '수급 이탈' 등 거칠고 냉정하게 팩트 폭격해라.
-          3. <code> 태그 및 백틱(```), 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지.
-          4. 강조 제목과 소제목은 오직 <b>텍스트</b> 태그만 사용해라.
+          [★ 가독성 및 톤앤매너 절대 지침 ★]
+          1. 텔레그램 모바일 화면에서 한눈에 시원하게 들어오도록 문단과 섹션, 종목 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣어라.
+          2. 절대 맹목적인 장밋빛 상승론(Bullish)을 펼치지 마라. 외인/기관의 단기 설거지, 윗꼬리 매물대, 이탈 위험을 거칠고 직설적으로 비판해라.
+          3. <code> 태그, 백틱(```), 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지.
+          4. 강조 제목과 소제목은 오직 <b>텍스트</b> 태그만 써라.
           5. 단독 < 또는 > 기호는 절대 쓰지 마라. (텔레그램 HTML 오류 방지)
 
-          [★ 출력 레이아웃 템플릿 ★]
+          [★ 반드시 아래 레이아웃 템플릿 그대로 출력할 것 ★]
           <b>📊 [{today}] 증시 수급 실상 & 기술적 주도주 3선</b>
 
           ━━━━━━━━━━━━━━━━━━━
@@ -323,21 +325,21 @@ jobs:
               except requests.exceptions.Timeout:
                   print(f"응답 시간 초과 (시도 {attempt}/{max_retries})")
               except Exception as e:
-                  print(f"Gemini 호출 오류: {e}")
+                  print(f"Gemini 예외 발생: {e}")
 
               if attempt < max_retries:
                   time.sleep(3)
 
           if not report_text:
-              print("❌ Gemini AI 리포트 생성 최종 실패")
+              print("❌ Gemini AI 리포트 생성 실패")
               sys.exit(1)
 
           report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
 
           # -------------------------------------------------------------
-          # 3. 텔레그램 분할 및 안전 발송
+          # 3. @MemilLynch 채널로 발송
           # -------------------------------------------------------------
-          print("3. 텔레그램 메시지 발송 시작...")
+          print(f"3. {chat_id} 채널로 메시지 발송 시작...")
           tg_send_url = f"{tg_base_url}/sendMessage"
 
           def send_to_telegram(msg_text):
@@ -353,10 +355,10 @@ jobs:
                   }, timeout=15)
 
                   if res.status_code == 200:
-                      print(f"[{idx+1}/{len(chunks)}] ✅ 텔레그램 HTML 발송 성공!")
+                      print(f"[{idx+1}/{len(chunks)}] ✅ 채널 발송 성공!")
                   else:
-                      print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 ({res.status_code}): {res.text}")
-                      print("HTML 태그를 제거하고 일반 텍스트로 즉시 재발송합니다...")
+                      print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 발송 실패 ({res.status_code}): {res.text}")
+                      print("일반 텍스트로 즉시 재전송합니다...")
                       plain_chunk = re.sub(r'<[^>]+>', '', chunk)
                       res_fallback = requests.post(tg_send_url, json={
                           "chat_id": chat_id,
@@ -365,18 +367,18 @@ jobs:
                       }, timeout=15)
 
                       if res_fallback.status_code == 200:
-                          print(f"[{idx+1}/{len(chunks)}] ✅ 텔레그램 일반 텍스트 발송 성공!")
+                          print(f"[{idx+1}/{len(chunks)}] ✅ 일반 텍스트 발송 성공!")
                       else:
-                          print(f"[{idx+1}/{len(chunks)}] ❌ 텔레그램 최종 실패 ({res_fallback.status_code}): {res_fallback.text}")
+                          print(f"[{idx+1}/{len(chunks)}] ❌ 채널 발송 최종 실패 ({res_fallback.status_code}): {res_fallback.text}")
                           success = False
 
               return success
 
           if not send_to_telegram(report_text):
-              print("❌ 에러: 텔레그램 메시지 전송 실패")
+              print("❌ 에러: 채널 메시지 전송 실패 (봇이 @MemilLynch 채널의 관리자로 등록되어 있는지 확인하세요)")
               sys.exit(1)
 
-          print("🎉 기술적 3선 기반 냉혹한 수급 리포트 발송 성공 완료!")
+          print(f"🎉 {chat_id} 채널에 수급 리포트 게시 완료!")
           EOF
 
           python run_agent.py
