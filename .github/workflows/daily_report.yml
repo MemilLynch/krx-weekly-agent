@@ -102,7 +102,7 @@ jobs:
               return total_vol, total_shares
 
           # -------------------------------------------------------------
-          # 2. 외국인/기관 순매수 수집 및 거래량 비중 연산 (정밀 파싱)
+          # 2. 외국인/기관 순매수 수집 및 거래량 비중 연산 (정밀 파싱 수정완료)
           # -------------------------------------------------------------
           def fetch_market_rank(mkt_gb, investor_gubun, top_n=10):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
@@ -112,7 +112,7 @@ jobs:
               data_list = []
               for tr in soup.find_all("tr"):
                   tds = tr.find_all("td")
-                  if len(tds) < 6:
+                  if len(tds) < 7:  # 네이버 컬럼은 총 7개
                       continue
 
                   a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
@@ -129,17 +129,19 @@ jobs:
                   code = code_match.group(1)
 
                   try:
-                      cur_price = tds[2].get_text(strip=True)
+                      cur_price = tds[2].get_text(strip=True).replace(",", "")
                       rate = tds[4].get_text(strip=True)
                       
-                      raw_vol_text = re.sub(r'[^\d]', '', tds[5].get_text(strip=True))
-                      raw_amt_text = re.sub(r'[^\d]', '', tds[6].get_text(strip=True)) if len(tds) >= 7 else "0"
+                      # 순매수량은 5번째, 순매수대금(백만)은 6번째 인덱스
+                      net_vol_str = re.sub(r'[^\d]', '', tds[5].get_text(strip=True))
+                      net_amt_str = re.sub(r'[^\d]', '', tds[6].get_text(strip=True))
 
-                      net_vol = int(raw_vol_text) if raw_vol_text else 0
-                      raw_amt_백만 = int(raw_amt_text) if raw_amt_text else 0
+                      net_vol = int(net_vol_str) if net_vol_str else 0
+                      raw_amt_백만 = int(net_amt_str) if net_amt_str else 0
 
                       amt_억 = round(raw_amt_백만 / 100, 1)
 
+                      # 개별 페이지에서 총거래량 확보
                       total_vol, total_shares = fetch_stock_meta(code)
                       vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
                       share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
@@ -147,7 +149,7 @@ jobs:
                       data_list.append({
                           "종목명": name,
                           "종목코드": code,
-                          "현재가": f"{cur_price}원" if not cur_price.endswith("원") else cur_price,
+                          "현재가": f"{int(cur_price):,}원" if cur_price.isdigit() else cur_price,
                           "등락률": rate,
                           "순매수대금": f"{amt_억:,}억",
                           "순매수대금_숫자": amt_억,
@@ -157,7 +159,7 @@ jobs:
                           "거래량대비순매수비중": vol_ratio,
                           "상장주식수대비비중": f"{share_ratio:.3f}%"
                       })
-                  except Exception:
+                  except Exception as e:
                       continue
 
                   if len(data_list) >= top_n:
@@ -166,10 +168,10 @@ jobs:
               return pd.DataFrame(data_list, columns=COLS)
 
           print("1. 네이버 금융에서 외국인/기관 수급 데이터 수집 중...")
-          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=10)
-          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=10)
-          df_inst_kospi = fetch_market_rank(1, 1000, top_n=10)
-          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=10)
+          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=12)
+          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=12)
+          df_inst_kospi = fetch_market_rank(1, 1000, top_n=12)
+          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=12)
 
           df_frgn_all = pd.concat([df_frgn_kospi, df_frgn_kosdaq], ignore_index=True)
           df_inst_all = pd.concat([df_inst_kospi, df_inst_kosdaq], ignore_index=True)
@@ -191,7 +193,7 @@ jobs:
                   df_dual = merged.sort_values(by='합산순매수대금', ascending=False).head(2).reset_index(drop=True)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"✅ 수집 완료: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건")
+          print(f"✅ 수집 완료: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건 확인")
 
           # -------------------------------------------------------------
           # 3. Gemini AI 팩트 기반 퀀트 브리핑 생성
