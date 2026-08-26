@@ -16,7 +16,7 @@ jobs:
           python-version: '3.11'
 
       - name: 필수 라이브러리 설치
-        run: pip install requests beautifulsoup4 pandas
+        run: pip install requests beautifulsoup4 pandas lxml
 
       - name: 메이저 수급 실데이터 분석 및 텔레그램 무음 발송
         env:
@@ -25,25 +25,21 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat << 'EOF' > run_agent.py
-          import os, sys, time, json, datetime, re, requests
+          import os, sys, time, datetime, re, requests
           import pandas as pd
           from bs4 import BeautifulSoup
 
           # -------------------------------------------------------------
-          # 0. 내부 통제: 환경변수 및 세션 초기화
+          # 0. 환경변수 검증
           # -------------------------------------------------------------
-          raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
-          raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-
-          gemini_key = raw_gemini_key.strip().strip("'").strip('"')
-          bot_token = raw_bot_token.strip().strip("'").strip('"')
-          chat_id = raw_chat_id.strip().strip("'").strip('"')
+          gemini_key = os.getenv("GEMINI_API_KEY", "").strip('\'"')
+          bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('\'"')
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
 
           if bot_token.lower().startswith("bot"): bot_token = bot_token[3:]
 
           if not gemini_key or not bot_token or not chat_id:
-              print("❌ 내부 통제 실패: 환경변수 누락")
+              print("❌ 환경변수 누락")
               sys.exit(1)
 
           HTTP = "https://"
@@ -55,7 +51,7 @@ jobs:
           session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
           # -------------------------------------------------------------
-          # 1. 랭킹 데이터 안전 파싱 엔진 (구조 변화 완벽 방어)
+          # 1. 최신 네이버 구조 대응 수급 파싱 엔진
           # -------------------------------------------------------------
           def get_market_rank(mkt_gb, investor_gubun):
               url = f"{HTTP}{NAVER}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
@@ -63,47 +59,58 @@ jobs:
               soup = BeautifulSoup(r.content.decode("cp949", errors="ignore"), "html.parser")
 
               data_list = []
+              # 모든 테이블 행(tr)을 순회하며 종목 링크가 있는 행만 타겟팅
               for tr in soup.find_all("tr"):
                   a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
-                  if not a_tag: continue
+                  if not a_tag:
+                      continue
                   
                   name = a_tag.text.strip()
-                  # ETF/ETN 인버스 등 수급 교란 요소 필터링
-                  if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN"]):
+                  if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN", "선물"]):
                       continue
 
                   code = re.search(r'code=(\d{6})', a_tag['href']).group(1)
 
-                  # 💥 핵심 로직: HTML 칸에 상관없이 텍스트를 파이프(|)로 결합하여 위치 역추적
-                  row_text = tr.get_text(separator='|', strip=True)
-                  parts = [p.strip() for p in row_text.split('|') if p.strip()]
+                  # 해당 행의 모든 텍스트 조각 추출 후 숫자 필터링
+                  texts = [t.strip() for t in tr.stripped_strings if t.strip()]
                   
                   try:
-                      name_idx = parts.index(name)
-                      price_str = re.sub(r'[^\d]', '', parts[name_idx + 1])
-                      net_amt_str = re.sub(r'[^\d]', '', parts[-1]) # 마지막은 항상 대금
-                      net_vol_str = re.sub(r'[^\d]', '', parts[-2]) # 끝에서 두번째는 수량
+                      # 종목명 다음부터 등장하는 숫자 데이터들 정제
+                      # 보통 [종목명, 현재가, 전일비, 등락률, 순매수량, 순매수대금(백만)] 순서
+                      numeric_vals = []
+                      for t in texts:
+                          clean_t = t.replace(',', '').replace('+', '').replace('-', '').replace('%', '')
+                          if clean_t.replace('.', '').isdigit():
+                              numeric_vals.append(t)
+
+                      if len(numeric_vals) < 3:
+                          continue
+
+                      # 가격, 순매수량, 순매수대금 추출 매핑
+                      price = int(re.sub(r'[^\d]', '', numeric_vals[0]))
                       
-                      rates = [p for p in parts if '%' in p]
-                      rate_str = rates[0] if rates else "0.0%"
-                      
-                      price = int(price_str)
-                      net_amt = int(net_amt_str)
-                      net_vol = int(net_vol_str)
-                      
-                      # 데이터 무결성 검증 (오류 파싱 차단)
+                      # 등락률 기호 확인
+                      rate_text = "0.0%"
+                      for t in texts:
+                          if '%' in t:
+                              rate_text = t
+                              break
+
+                      net_vol = int(re.sub(r'[^\d-]', '', numeric_vals[-2]))
+                      net_amt = int(re.sub(r'[^\d-]', '', numeric_vals[-1]))
+
                       if price < 100 or net_vol <= 0 or net_amt <= 0:
                           continue
 
                       data_list.append({
-                          "종목명": name, "종목코드": code, "현재가": price, "등락률": rate_str,
+                          "종목명": name, "종목코드": code, "현재가": price, "등락률": rate_text,
                           "순매수량": net_vol, "순매수대금": net_amt
                       })
                   except Exception:
                       continue
               return data_list
 
-          print("1. 외인/기관 순매수 데이터 안전 추출 중...")
+          print("1. 네이버 수급 데이터 최신 구조 파싱 중...")
           frgn_data = get_market_rank('1', '9000') + get_market_rank('2', '9000')
           inst_data = get_market_rank('1', '1000') + get_market_rank('2', '1000')
 
@@ -111,7 +118,7 @@ jobs:
           df_inst = pd.DataFrame(inst_data)
 
           # -------------------------------------------------------------
-          # 2. 거래량 비중 연산 (최소 통신)
+          # 2. 메타데이터(거래량/상장주식수) 연산
           # -------------------------------------------------------------
           def get_meta_data(code):
               try:
@@ -148,7 +155,7 @@ jobs:
               res_df = pd.DataFrame(results)
               return res_df.sort_values(by='거래량비중', ascending=False).head(3).reset_index(drop=True)
 
-          print("2. 거래량 비중 연산 (과부하 회피)...")
+          print("2. 거래량 비중 연산 수행 중...")
           df_frgn_top = process_top_stocks(df_frgn)
           df_inst_top = process_top_stocks(df_inst)
 
@@ -172,14 +179,14 @@ jobs:
                   df_dual = pd.DataFrame(dual_res)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"✅ 연산 완료: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건 정상 산출")
+          print(f"✅ 연산 성공: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건")
 
           # -------------------------------------------------------------
-          # 3. 제미나이 프롬프트 생성 (AI 할루시네이션 원천 통제)
+          # 3. Gemini 프롬프트 및 리포트 생성
           # -------------------------------------------------------------
-          frgn_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_frgn_top.iterrows()]) if not df_frgn_top.empty else "데이터 없음"
-          inst_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_inst_top.iterrows()]) if not df_inst_top.empty else "데이터 없음"
-          dual_str = "\n".join([f"{i+1}. {r['쌍끌이_텍스트']}" for i, r in df_dual.iterrows()]) if not df_dual.empty else "쌍끌이 종목 없음"
+          frgn_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_frgn_top.iterrows()]) if not df_frgn_top.empty else "당일 집계 종목 없음"
+          inst_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_inst_top.iterrows()]) if not df_inst_top.empty else "당일 집계 종목 없음"
+          dual_str = "\n".join([f"{i+1}. {r['쌍끌이_텍스트']}" for i, r in df_dual.iterrows()]) if not df_dual.empty else "당일 동시 매집 종목 없음"
 
           prompt = f"""
           오늘({today}) 국내 증시 기관/외국인 수급 팩트 데이터다.
