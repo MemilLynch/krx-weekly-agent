@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 기관 수급 분석 및 채널 발송
+      - name: 메이저 수급 분석 및 봇 채널 무음 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -36,22 +36,21 @@ jobs:
           import pandas as pd
 
           # -------------------------------------------------------------
-          # 0. 전송 대상 설정
+          # 0. 환경변수 및 전송 대상 설정 (Secrets의 TELEGRAM_CHAT_ID 사용)
           # -------------------------------------------------------------
-          TARGET_CHANNEL = "@MemilLynch"
-
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip("'").strip('"')
+          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
 
           gemini_key = raw_gemini_key.strip().strip("'").strip('"')
           bot_token = raw_bot_token.strip().strip("'").strip('"')
+          chat_id = raw_chat_id.strip().strip("'").strip('"')
 
           if bot_token.lower().startswith("bot"):
               bot_token = bot_token[3:]
 
-          if not gemini_key or not bot_token:
-              print("❌ 환경변수 오류: GEMINI_API_KEY 또는 TELEGRAM_BOT_TOKEN이 누락되었습니다.")
+          if not gemini_key or not bot_token or not chat_id:
+              print("❌ 환경변수 오류: GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 중 누락된 값이 있습니다.")
               sys.exit(1)
 
           HTTP_SCHEME = "https://"
@@ -66,7 +65,7 @@ jobs:
           }
 
           # -------------------------------------------------------------
-          # 1. 상장주식수 조회
+          # 1. 상장주식수 조회 함수
           # -------------------------------------------------------------
           def fetch_total_shares(code):
               try:
@@ -86,9 +85,9 @@ jobs:
               return 0
 
           # -------------------------------------------------------------
-          # 2. 사모펀드/연기금 수급 원천 데이터 수집
+          # 2. 외국인(9000) / 기관(1000) 실데이터 수집 및 수급 지표 연산
           # -------------------------------------------------------------
-          def fetch_institutional_data(mkt_gb, investor_gubun, top_n=10):
+          def fetch_market_rank(mkt_gb, investor_gubun, top_n=15):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
               soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
@@ -113,14 +112,14 @@ jobs:
                   code = code_match.group(1)
 
                   try:
-                      cur_price = tds[2].get_text(strip=True)
+                      cur_price = tds[2].get_text(strip=True).replace(",", "")
                       rate = tds[4].get_text(strip=True)
                       total_vol = int(tds[5].get_text(strip=True).replace(",", ""))
                       net_vol = int(tds[6].get_text(strip=True).replace(",", ""))
                       raw_amt_백만 = int(tds[7].get_text(strip=True).replace(",", ""))
-                      
+
                       amt_억 = round(raw_amt_백만 / 100, 1)
-                      volume_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
+                      vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
 
                       total_shares = fetch_total_shares(code)
                       share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
@@ -128,12 +127,14 @@ jobs:
                       data_list.append({
                           "종목명": name,
                           "종목코드": code,
-                          "현재가": f"{cur_price}원",
+                          "현재가": f"{int(cur_price):,}원",
                           "등락률": rate,
                           "순매수대금": f"{amt_억:,}억",
+                          "순매수대금_숫자": amt_억,
                           "총거래량": f"{total_vol:,}주",
                           "순매수량": f"{net_vol:,}주",
-                          "거래량대비순매수비중": volume_ratio,
+                          "순매수량_숫자": net_vol,
+                          "거래량대비순매수비중": vol_ratio,
                           "상장주식수대비비중": f"{share_ratio:.3f}%"
                       })
                   except Exception:
@@ -144,159 +145,78 @@ jobs:
 
               return pd.DataFrame(data_list)
 
-          print("1. 네이버 금융에서 사모펀드 / 연기금 수급 원천 데이터 수집 중...")
-          df_pef_kospi = fetch_institutional_data(1, 8000, top_n=6)
-          df_pef_kosdaq = fetch_institutional_data(2, 8000, top_n=6)
-          df_pension_kospi = fetch_institutional_data(1, 7000, top_n=6)
-          df_pension_kosdaq = fetch_institutional_data(2, 7000, top_n=6)
+          print("1. 네이버 금융에서 외국인/기관 수급 데이터 수집 중...")
+          # 외국인(9000), 기관(1000) | 코스피(1), 코스닥(2)
+          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=12)
+          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=12)
+          df_inst_kospi = fetch_market_rank(1, 1000, top_n=12)
+          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=12)
 
-          pef_combined = pd.concat([df_pef_kospi, df_pef_kosdaq], ignore_index=True)
-          pension_combined = pd.concat([df_pension_kospi, df_pension_kosdaq], ignore_index=True)
+          df_frgn_all = pd.concat([df_frgn_kospi, df_frgn_kosdaq], ignore_index=True)
+          df_inst_all = pd.concat([df_inst_kospi, df_inst_kosdaq], ignore_index=True)
 
-          pef_top = pef_combined.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not pef_combined.empty else pd.DataFrame()
-          pension_top = pension_combined.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not pension_combined.empty else pd.DataFrame()
+          # 1. 외국인 거래량 비중 상위 3종목
+          df_frgn_top = df_frgn_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True)
+
+          # 2. 기관 거래량 비중 상위 3종목
+          df_inst_top = df_inst_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True)
+
+          # 3. 외인·기관 동시 순매수(쌍끌이) 상위 2종목 결합
+          df_dual = pd.DataFrame()
+          if not df_frgn_all.empty and not df_inst_all.empty:
+              merged = pd.merge(
+                  df_frgn_all[['종목명', '종목코드', '현재가', '등락률', '순매수대금', '순매수대금_숫자', '거래량대비순매수비중']],
+                  df_inst_all[['종목코드', '순매수대금', '순매수대금_숫자', '거래량대비순매수비중']],
+                  on='종목코드',
+                  suffixes=('_외국인', '_기관')
+              )
+              if not merged.empty:
+                  merged['합산순매수대금'] = merged['순매수대금_숫자_외국인'] + merged['순매수대금_숫자_기관']
+                  merged['합산거래량비중'] = (merged['거래량대비순매수비중_외국인'] + merged['거래량대비순매수비중_기관']).round(2)
+                  df_dual = merged.sort_values(by='합산순매수대금', ascending=False).head(2).reset_index(drop=True)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"✅ 수집 완료: 사모펀드 {len(pef_top)}종목, 연기금 {len(pension_top)}종목")
+          print(f"✅ 수집 성공: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건 확인")
 
           # -------------------------------------------------------------
-          # 3. Gemini AI 퀀트 리서치 브리핑 생성
+          # 3. Gemini AI 팩트 기반 퀀트 브리핑 생성
           # -------------------------------------------------------------
           prompt = f"""
-          오늘({today}) 국내 증시 사모펀드 및 연기금 수급 집계 데이터다.
-          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 기관이 순매수한 수량의 비율(%).
+          오늘({today}) 국내 증시 외국인 및 기관 공식 수급 집계 데이터다.
+          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 주체가 순매수한 수량의 비율(%). 당일 유통 거래 중 매수 집중도를 의미.
           - 상장주식수 대비 비중: 전체 상장주식수 대비 당일 순매수한 주식의 비율(%).
 
-          [사모펀드 거래량 비중 상위 3종목]
-          {pef_top.to_string(index=False) if not pef_top.empty else "집계 데이터 없음"}
+          [외국인 거래량 비중 상위 3종목]
+          {df_frgn_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False)}
 
-          [연기금 거래량 비중 상위 3종목]
-          {pension_top.to_string(index=False) if not pension_top.empty else "집계 데이터 없음"}
+          [기관 거래량 비중 상위 3종목]
+          {df_inst_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False)}
 
-          [★ 톤앤매너 및 작성 원칙 ★]
-          1. 억지스러운 영문 약어(VPR, POV 등)는 일체 사용하지 마라.
-          2. 리딩방 스타일(지지선, 저항선, 손절가, 목표가, 추천, 진입 타점 등)의 표현을 엄격히 금지한다.
-          3. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 수치와 거래 팩트만 서술해라.
-          4. 텔레그램 모바일 가독성을 위해 각 섹션 및 각 종목(■ 1., ■ 2., ■ 3.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 유지해라.
-          5. <code> 태그, 백틱(```), 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목 및 강조는 <b>텍스트</b> 태그만 사용.
-          6. 단독 < 또는 > 기호는 절대 쓰지 마라. (텔레그램 HTML 오류 방지)
+          [외인·기관 동시 순매수(쌍끌이) 종목]
+          {df_dual[['종목명', '현재가', '등락률', '순매수대금_외국인', '순매수대금_기관', '합산순매수대금', '합산거래량비중']].to_string(index=False) if not df_dual.empty else "당일 양대 주체 동시 상위 매집 종목 없음"}
+
+          [★ 작성 원칙 및 서식 ★]
+          1. 임의의 억지 약어(VPR 등) 절대 사용 금지.
+          2. 리딩방 스타일(지지선, 저항선, 손절가, 목표가, 추천, 진입 타점 등) 표현 일체 금지.
+          3. 증권사 퀀트 리서치 센터의 객관적이고 드라이(Dry)한 어조로 수치와 거래 팩트만 서술할 것.
+          4. 텔레그램 모바일 가독성을 위해 각 섹션 및 각 종목(■ 1., ■ 2., ■ 3.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣을 것.
+          5. <code>, ```, 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목 및 강조는 <b>텍스트</b> 태그만 사용.
+          6. 단독 < 또는 > 기호는 절대 쓰지 말 것. (텔레그램 HTML 오류 방지)
 
           [★ 출력 레이아웃 템플릿 ★]
-          <b>📊 [{today}] 사모펀드·연기금 수급 분석 브리핑</b>
+          <b>📊 [{today}] 외국인·기관 수급 분석 브리핑</b>
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>1. 📌 당일 기관 수급 동향</b>
+          <b>1. 📌 당일 시장 수급 동향</b>
 
-          • 사모펀드 및 연기금의 총 거래량 대비 순매수 집중도와 수급 특이사항 요약 (2줄 이내)
+          • 외국인 및 기관의 총 거래량 대비 순매수 집중도와 시장 수급 특이사항 요약 (2줄 이내)
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>2. 🎯 사모펀드 순매수 비중 상위</b>
+          <b>2. 🎯 외국인 순매수 비중 상위</b>
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
           • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
-
-          <b>■ 3. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
-
-          ━━━━━━━━━━━━━━━━━━━
-          <b>3. 🛡️ 연기금 순매수 비중 상위</b>
-
-          <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 중장기 매수 특성 (객관적 팩트 1줄)
-
-          <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 중장기 매수 특성 (객관적 팩트 1줄)
-
-          <b>■ 3. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 중장기 매수 특성 (객관적 팩트 1줄)
-
-          ━━━━━━━━━━━━━━━━━━━
-          <b>4. 💡 수급 특이사항 요약</b>
-
-          • 총 거래량 대비 기관 순매수 집중도가 높게 나타난 종목군 및 시장 수급 쏠림 현상 정리 (2줄 이내)
-          """
-
-          gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
-          payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
-          report_text = None
-          max_retries = 3
-
-          for attempt in range(1, max_retries + 1):
-              print(f"2. Gemini 리포트 생성 중... (시도 {attempt}/{max_retries})")
-              try:
-                  g_res = requests.post(
-                      gemini_api_url,
-                      params={"key": gemini_key},
-                      headers={"Content-Type": "application/json"},
-                      data=json.dumps(payload),
-                      timeout=90
-                  )
-                  if g_res.status_code == 200:
-                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                      break
-                  else:
-                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
-              except Exception as e:
-                  print(f"Gemini 호출 오류: {e}")
-              time.sleep(3)
-
-          if not report_text:
-              print("❌ Gemini 리포트 생성 실패")
-              sys.exit(1)
-
-          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
-          report_text = re.sub(r'(━━━━━━━━━━━━━━━━━━━)(\s*)([1-4]\.)', r'\1\n\n<b>\3', report_text)
-          report_text = re.sub(r'([^\n])(\s*)(■ \d\.)', r'\1\n\n\3', report_text)
-
-          # -------------------------------------------------------------
-          # 4. 정밀 전송 엔진 (채널 발송 시도 후 상세 로그 출력)
-          # -------------------------------------------------------------
-          def send_msg(dest_id, text_content):
-              url = f"{tg_base_url}/sendMessage"
-              res = requests.post(url, json={
-                  "chat_id": dest_id,
-                  "text": text_content,
-                  "parse_mode": "HTML",
-                  "disable_web_page_preview": True
-              }, timeout=15)
-              
-              res_data = res.json()
-              if res.status_code == 200 and res_data.get("ok"):
-                  chat_info = res_data["result"].get("chat", {})
-                  c_title = chat_info.get("title", chat_info.get("first_name", "Unknown"))
-                  c_type = chat_info.get("type", "unknown")
-                  c_id = chat_info.get("id", "unknown")
-                  print(f"✅ 전송 성공! -> 방 이름: [{c_title}], 타입: [{c_type}], ID: [{c_id}]")
-                  return True
-              else:
-                  err_desc = res_data.get("description", res.text)
-                  print(f"⚠️ 전송 실패 (대상: {dest_id}) -> 원인: {err_desc}")
-                  return False
-
-          print(f"3. 텔레그램 메시지 발송 시작...")
-          # 1순위: @MemilLynch 채널로 발송
-          sent = send_msg(TARGET_CHANNEL, report_text)
-
-          # 채널 발송 실패 시 Secrets에 저장된 개인 Chat ID로 비상 발송
-          if not sent and raw_chat_id:
-              print(f"🔄 '{TARGET_CHANNEL}' 발송 실패로 인해 Secrets의 TELEGRAM_CHAT_ID({raw_chat_id})로 재전송 시도...")
-              sent = send_msg(raw_chat_id, report_text)
-
-          if not sent:
-              print("❌ 텔레그램 최종 발송 실패. 봇 권한 또는 채널 아이디를 확인하세요.")
-              sys.exit(1)
-
-          print("🎉 리포트 발송 프로세스 완료!")
-          EOF
-
-          python run_agent.py
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비
