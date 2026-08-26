@@ -15,10 +15,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 필수 라이브러리 설치
-        run: pip install requests beautifulsoup4 pandas
+      - name: KRX 공식 데이터 및 필수 라이브러리 설치
+        run: pip install pykrx requests beautifulsoup4 pandas
 
-      - name: KRX 공식 로우데이터 퀀트 분석 및 채널 발송
+      - name: KRX 원천데이터 퀀트 분석 및 채널 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -30,13 +30,13 @@ jobs:
           import time
           import json
           import datetime
-          import requests
-          from bs4 import BeautifulSoup
-          import pandas as pd
           import re
+          import requests
+          import pandas as pd
+          from pykrx import stock
 
           # -------------------------------------------------------------
-          # 0. 전송 대상 채널 설정 (@MemilLynch)
+          # 0. 전송 대상 채널 및 환경변수 정제
           # -------------------------------------------------------------
           TARGET_CHANNEL = "@MemilLynch"
 
@@ -52,150 +52,122 @@ jobs:
               bot_token = bot_token[3:]
 
           if not gemini_key or not bot_token:
-              print("❌ 환경변수 오류: API 키가 누락되었습니다.")
+              print("❌ 환경변수 오류: GEMINI_API_KEY 또는 TELEGRAM_BOT_TOKEN이 누락되었습니다.")
               sys.exit(1)
 
           HTTP_SCHEME = "https://"
-          NAVER_DOMAIN = "finance.naver.com"
           GEMINI_DOMAIN = "generativelanguage.googleapis.com"
           TG_DOMAIN = "api.telegram.org"
           tg_base_url = f"{HTTP_SCHEME}{TG_DOMAIN}/bot{bot_token}"
 
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-              "Referer": f"{HTTP_SCHEME}{NAVER_DOMAIN}/"
-          }
+          # -------------------------------------------------------------
+          # 1. 가장 최신의 유효 거래일 탐색 (주말/공휴일/장마감 전후 자동 보정)
+          # -------------------------------------------------------------
+          print("1. KRX 공식 서버에서 최신 거래일 조회 중...")
+          now = datetime.datetime.now()
+          target_date = None
 
-          # -------------------------------------------------------------
-          # 1. KRX 공식 로우데이터 기반 개별 종목 메트릭 추출
-          # -------------------------------------------------------------
-          def enrich_stock_meta(code):
-              total_vol = 0
-              total_shares = 0
+          for i in range(10):
+              check_date = (now - datetime.timedelta(days=i)).strftime("%Y%m%d")
               try:
-                  # 개별 종목 시세에서 당일 총 거래량 추출
-                  f_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/frgn.naver?code={code}"
-                  f_res = requests.get(f_url, headers=headers, timeout=10)
-                  soup = BeautifulSoup(f_res.content.decode("cp949", errors="ignore"), "html.parser")
-                  for tr in soup.find_all("tr"):
-                      tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                      if len(tds) >= 7 and re.match(r'^\d{4}\.\d{2}\.\d{2}$', tds[0]):
-                          total_vol = int(tds[4].replace(",", ""))
-                          break
-                  
-                  # 상장주식수 추출
-                  m_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
-                  m_res = requests.get(m_url, headers=headers, timeout=10)
-                  m_html = m_res.content.decode("cp949", errors="ignore")
-                  shares_match = re.search(r'상장주식수[^\d]*([\d,]+)', m_html)
-                  if shares_match:
-                      total_shares = int(shares_match.group(1).replace(",", ""))
-              except Exception:
-                  pass
-              return total_vol, total_shares
-
-          def fetch_institutional_rank(mkt_gb, investor_gubun, top_n=8):
-              url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
-              res = requests.get(url, headers=headers, timeout=15)
-              html_text = res.content.decode("cp949", errors="ignore")
-
-              pattern = r'href=["\'][^"\']*code=(\d{6})["\'][^>]*>([^<]+)</a>'
-              matches = list(re.finditer(pattern, html_text, re.IGNORECASE))
-
-              cols = ["종목명", "종목코드", "현재가", "등락률", "총거래량", "순매수량", "순매수대금", "VPR(점유율)", "지분침투율"]
-              data_list = []
-
-              for i, match in enumerate(matches):
-                  if len(data_list) >= top_n:
+                  test_df = stock.get_market_ohlcv(check_date, market="KOSPI")
+                  if not test_df.empty and test_df['거래량'].sum() > 0:
+                      target_date = check_date
                       break
+              except Exception:
+                  continue
 
-                  code = match.group(1)
-                  name = match.group(2).strip()
-                  if not name or any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "레버리지", "인버스"]):
+          if not target_date:
+              target_date = now.strftime("%Y%m%d")
+
+          formatted_date = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
+          print(f"✅ 기준 거래일자: {formatted_date}")
+
+          # -------------------------------------------------------------
+          # 2. KRX 공식 로우데이터 수집 (사모펀드, 연기금, 시세, 상장주식수)
+          # -------------------------------------------------------------
+          print("2. 사모펀드 / 연기금 순매수 및 시장 원천 데이터 수집 중...")
+          try:
+              df_pef = stock.get_market_net_purchases_of_equities_by_ticker(target_date, target_date, "ALL", "사모")
+              df_pension = stock.get_market_net_purchases_of_equities_by_ticker(target_date, target_date, "ALL", "연기금")
+              df_ohlcv = stock.get_market_ohlcv(target_date, market="ALL")
+              df_cap = stock.get_market_cap(target_date, market="ALL")
+          except Exception as e:
+              print(f"❌ KRX 데이터 수집 실패: {e}")
+              sys.exit(1)
+
+          def extract_quant_vpr(df_investor, min_amt_억=2.0, top_n=3):
+              if df_investor.empty or df_ohlcv.empty or df_cap.empty:
+                  return pd.DataFrame()
+
+              merged = df_investor.join(df_ohlcv[['종가', '등락률', '거래량']], how='inner')
+              merged = merged.join(df_cap[['상장주식수']], how='inner')
+
+              # 최소 순매수 대금 필터링 (노이즈 제거)
+              merged = merged[merged['순매수대금'] >= (min_amt_억 * 100_000_000)].copy()
+
+              records = []
+              for ticker, row in merged.iterrows():
+                  name = stock.get_market_ticker_name(ticker)
+                  if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스"]):
                       continue
 
-                  start = match.end()
-                  end = matches[i + 1].start() if i + 1 < len(matches) else start + 1500
-                  chunk = html_text[start:end]
+                  total_vol = int(row['거래량'])
+                  net_vol = int(row['순매수거래량'])
+                  total_shares = int(row['상장주식수'])
+                  close_price = int(row['종가'])
+                  rate = float(row['등락률'])
+                  net_amt_억 = round(row['순매수대금'] / 100_000_000, 1)
 
-                  clean_chunk = re.sub(r'<[^>]+>', ' ', chunk).replace('&nbsp;', ' ')
-                  tokens = [t.strip() for t in clean_chunk.split() if t.strip()]
-
-                  cur_price = tokens[0] if len(tokens) > 0 else "-"
-                  rate = next((t for t in tokens if "%" in t), "-")
-                  num_tokens = [t for t in tokens if re.search(r'\d', t) and "%" not in t]
-
-                  raw_vol = num_tokens[-2] if len(num_tokens) >= 3 else (tokens[3] if len(tokens) > 3 else "0")
-                  raw_amt = num_tokens[-1] if len(num_tokens) >= 2 else (tokens[-1] if tokens else "0")
-
-                  net_vol = int(re.sub(r'[^\d]', '', raw_vol)) if re.sub(r'[^\d]', '', raw_vol) else 0
-                  clean_amt = re.sub(r'[^\d.]', '', raw_amt)
-                  amt_100m = f"{round(float(clean_amt) / 100, 1):,}억" if clean_amt else raw_amt
-
-                  # 개별 종목 총거래량 및 상장주식수 결합
-                  total_vol, total_shares = enrich_stock_meta(code)
-                  
-                  # 1. 거래량 점유율 VPR (당일 총 거래량 중 순매수 비중)
                   vpr = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
-                  # 2. 지분 침투율 (상장주식수 대비 순매수 비중)
                   penetration = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
 
-                  data_list.append({
+                  records.append({
                       "종목명": name,
-                      "종목코드": code,
-                      "현재가": cur_price,
-                      "등락률": rate,
-                      "총거래량": f"{total_vol:,}주" if total_vol > 0 else "-",
+                      "종목코드": ticker,
+                      "현재가": f"{close_price:,}원",
+                      "등락률": f"{rate:+.2f}%",
+                      "순매수대금": f"{net_amt_억:,}억",
+                      "총거래량": f"{total_vol:,}주",
                       "순매수량": f"{net_vol:,}주",
-                      "순매수대금": amt_100m,
-                      "VPR(점유율)": vpr,
-                      "지분침투율": f"{penetration}%"
+                      "VPR": vpr,
+                      "지분침투율": f"{penetration:.3f}%"
                   })
 
-              df = pd.DataFrame(data_list, columns=cols)
-              return df
+              res_df = pd.DataFrame(records)
+              if not res_df.empty:
+                  res_df = res_df.sort_values(by="VPR", ascending=False).head(top_n).reset_index(drop=True)
+              return res_df
 
-          print("1. KRX 공식 수급 기반 퀀트 데이터 추출 중...")
-          # 사모펀드 (8000), 연기금 (7000)
-          df_pef_kospi = fetch_institutional_rank(1, 8000, top_n=6)
-          df_pef_kosdaq = fetch_institutional_rank(2, 8000, top_n=6)
-          df_pension_kospi = fetch_institutional_rank(1, 7000, top_n=6)
-          df_pension_kosdaq = fetch_institutional_rank(2, 7000, top_n=6)
+          df_pef_top = extract_quant_vpr(df_pef, min_amt_억=2.0, top_n=3)
+          df_pension_top = extract_quant_vpr(df_pension, min_amt_억=3.0, top_n=3)
 
-          pef_combined = pd.concat([df_pef_kospi, df_pef_kosdaq], ignore_index=True)
-          pension_combined = pd.concat([df_pension_kospi, df_pension_kosdaq], ignore_index=True)
-
-          # VPR(거래량 점유율) 기준 상위 3종목 선별
-          pef_top = pef_combined.sort_values(by="VPR(점유율)", ascending=False).head(3) if not pef_combined.empty else pd.DataFrame()
-          pension_top = pension_combined.sort_values(by="VPR(점유율)", ascending=False).head(3) if not pension_combined.empty else pd.DataFrame()
-
-          today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print("2. Gemini AI 퀀트 브리핑 생성 중...")
+          print("3. Gemini AI 퀀트 리서치 생성 중...")
 
           # -------------------------------------------------------------
-          # 2. Gemini AI 퀀트 데스크 분석 (gemini-3.6-flash 공식 엔드포인트)
+          # 3. Gemini AI 퀀트 리포트 생성 (gemini-3.6-flash)
           # -------------------------------------------------------------
           prompt = f"""
-          오늘({today}) 한국거래소(KRX) 공식 집계 기반 사모펀드(8000) 및 연기금(7000) 퀀트 수급 데이터다.
-          - VPR (Volume Participation Rate): 당일 총 거래량 중 해당 주체의 순매수 비중(%). 수치가 높을수록 당일 호가창 장악력이 높음.
+          기준 거래일자: [{formatted_date}]
+          KRX(한국거래소) 공식 집계 기반 사모펀드 및 연기금의 거래량 점유율(VPR) 퀀트 데이터다.
+          - VPR(Volume Participation Rate): 당일 총거래량 중 해당 주체의 순매수 비중(%). 수치가 높을수록 호가창 유통 물량 장악력이 큼.
           - 지분침투율: 상장주식 총수 대비 당일 순매수 주식수 비율(%).
 
-          [사모펀드 VPR 상위 3종목]
-          {pef_top.to_string(index=False)}
+          [사모펀드 VPR 최상위 종목]
+          {df_pef_top.to_string(index=False) if not df_pef_top.empty else "집계 기준 만족 종목 없음"}
 
-          [연기금 VPR 상위 3종목]
-          {pension_top.to_string(index=False)}
+          [연기금 VPR 최상위 종목]
+          {df_pension_top.to_string(index=False) if not df_pension_top.empty else "집계 기준 만족 종목 없음"}
 
-          [★ 톤앤매너 및 서식 절대 준수 ★]
-          1. 리딩방 스타일(지지선, 저항선, 손절가, 목표가, 추천, 진입 구간 등)의 어휘는 절대 사용 금지.
-          2. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 데이터와 시장 미시구조(Microstructure) 사실만 서술할 것.
-          3. 텔레그램 모바일 가독성을 위해 문단과 종목 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣을 것.
-          4. <code> 태그, 백틱(```), 마크다운 표(|---|), 마크다운 볼드(**) 절대 사용 금지.
-          5. 강조 제목과 소제목은 오직 <b>텍스트</b> 태그만 사용할 것.
-          6. 단독 < 또는 > 기호는 절대 쓰지 말 것. (텔레그램 HTML 파싱 오류 방지)
+          [★ 작성 규칙 - 절대 엄수 ★]
+          1. 리딩방 스타일(지지선, 저항선, 손절가, 목표가, 추천 등) 어휘 일체 사용 금지.
+          2. 증권사 퀀트 리서치 센터 톤으로 철저히 데이터, VPR 수치, 지분침투율 팩트만 드라이하게 기술할 것.
+          3. 모바일 가독성을 위해 각 섹션 및 각 종목(■ 1., ■ 2., ■ 3.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣을 것.
+          4. <code>, ```, 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목/소제목은 <b>텍스트</b> 태그만 사용.
+          5. 단독 < 또는 > 기호 절대 사용 금지.
 
-          [★ 출력 레이아웃 템플릿 ★]
-          <b>📊 [{today}] 퀀트 수급 브리핑: 스마트머니 VPR 분석</b>
+          [★ 반드시 아래 템플릿 서식을 그대로 출력할 것 ★]
+          <b>📊 [{formatted_date}] 퀀트 수급 브리핑: 스마트머니 VPR 분석</b>
 
           ━━━━━━━━━━━━━━━━━━━
           <b>1. 📌 당일 시장 미시구조 (Microstructure)</b>
@@ -207,35 +179,35 @@ jobs:
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 데이터:</b> 순매수 OOO억 / VPR O.O% / 지분침투율 O.OO%
-          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 및 특이점 (객관적 팩트 1줄)
+          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 팩트 요약 (1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
           • <b>수급 데이터:</b> 순매수 OOO억 / VPR O.O% / 지분침투율 O.OO%
-          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 및 특이점 (객관적 팩트 1줄)
+          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 팩트 요약 (1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
           • <b>수급 데이터:</b> 순매수 OOO억 / VPR O.O% / 지분침투율 O.OO%
-          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 및 특이점 (객관적 팩트 1줄)
+          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 팩트 요약 (1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>3. 🛡️ 연기금 (Slow Money) 매물 잠금 상위</b>
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 데이터:</b> 순매수 OOO억 / VPR O.O% / 지분침투율 O.OO%
-          • <b>데이터 진단:</b> VPR 수치 기반의 중기 매물 흡수 및 자금 성격 (객관적 팩트 1줄)
+          • <b>데이터 진단:</b> VPR 수치 기반의 중기 매물 흡수 및 자금 성격 요약 (1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
           • <b>수급 데이터:</b> 순매수 OOO억 / VPR O.O% / 지분침투율 O.OO%
-          • <b>데이터 진단:</b> VPR 수치 기반의 중기 매물 흡수 및 자금 성격 (객관적 팩트 1줄)
+          • <b>데이터 진단:</b> VPR 수치 기반의 중기 매물 흡수 및 자금 성격 요약 (1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
           • <b>수급 데이터:</b> 순매수 OOO억 / VPR O.O% / 지분침투율 O.OO%
-          • <b>데이터 진단:</b> VPR 수치 기반의 중기 매물 흡수 및 자금 성격 (객관적 팩트 1줄)
+          • <b>데이터 진단:</b> VPR 수치 기반의 중기 매물 흡수 및 자금 성격 요약 (1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>4. 💡 퀀트 데스크 특이사항 (Quant Notes)</b>
 
-          • 총 거래량 대비 기관 순매수 비중(VPR)이 비정상적으로 높게 형성된 종목군 또는 가격-수급 불일치 이상 현상 정리 (2줄 이내)
+          • 총거래량 대비 기관 순매수 비중(VPR)이 비정상적으로 높게 형성된 종목군 및 수급 쏠림 현상 정리 (2줄 이내)
           """
 
           gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
@@ -267,12 +239,16 @@ jobs:
               print("❌ Gemini 리포트 생성 실패")
               sys.exit(1)
 
+          # -------------------------------------------------------------
+          # 4. 서식 및 줄바꿈 강제 보정 후 @MemilLynch 발송
+          # -------------------------------------------------------------
           report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
+          
+          # 모바일 줄바꿈 강제 정렬
+          report_text = re.sub(r'(━━━━━━━━━━━━━━━━━━━)(\s*)([1-4]\.)', r'\1\n\n<b>\3', report_text)
+          report_text = re.sub(r'([^\n])(\s*)(■ \d\.)', r'\1\n\n\3', report_text)
 
-          # -------------------------------------------------------------
-          # 3. @MemilLynch 채널로 발송
-          # -------------------------------------------------------------
-          print(f"3. {chat_id} 채널로 발송 시작...")
+          print(f"4. {chat_id} 채널로 메시지 발송 시작...")
           tg_send_url = f"{tg_base_url}/sendMessage"
 
           def send_to_telegram(msg_text):
@@ -305,7 +281,7 @@ jobs:
               print("❌ 에러: 채널 발송 실패")
               sys.exit(1)
 
-          print("🎉 VPR 기반 퀀트 리포트 발송 완료!")
+          print("🎉 KRX 원천데이터 기반 퀀트 리포트 발송 완료!")
           EOF
 
           python run_agent.py
