@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 기관 퀀트 데이터 추출 및 발송
+      - name: 기관 퀀트 데이터 추출 및 채널 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -36,7 +36,7 @@ jobs:
           import re
 
           # -------------------------------------------------------------
-          # 0. 전송 대상 채널 설정
+          # 0. 전송 대상 채널 설정 (@MemilLynch)
           # -------------------------------------------------------------
           TARGET_CHANNEL = "@MemilLynch"
 
@@ -67,134 +67,158 @@ jobs:
           }
 
           # -------------------------------------------------------------
-          # 1. 기관별 거래량 점유율(VPR) 정밀 추출 로직
+          # 1. 랭킹 수집 및 종목별 총 거래량 조회 기반 VPR(점유율) 연산
           # -------------------------------------------------------------
-          def fetch_quant_deal_rank(mkt_gb, investor_gubun, top_n=15):
+          def fetch_stock_total_volume(code):
+              try:
+                  url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/frgn.naver?code={code}"
+                  res = requests.get(url, headers=headers, timeout=10)
+                  soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
+                  for tr in soup.find_all("tr"):
+                      tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                      if len(tds) >= 7 and re.match(r'^\d{4}\.\d{2}\.\d{2}$', tds[0]):
+                          total_vol = int(tds[4].replace(",", ""))
+                          return total_vol
+              except Exception:
+                  pass
+              return 0
+
+          def fetch_quant_rank(mkt_gb, investor_gubun, top_n=6):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
-              soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
+              html_text = res.content.decode("cp949", errors="ignore")
 
+              pattern = r'href=["\'][^"\']*code=(\d{6})["\'][^>]*>([^<]+)</a>'
+              matches = list(re.finditer(pattern, html_text, re.IGNORECASE))
+
+              cols = ["종목명", "종목코드", "현재가", "등락률", "총거래량", "순매수량", "순매수대금", "거래량점유율(VPR)"]
               data_list = []
-              for tr in soup.find_all("tr"):
-                  tds = tr.find_all("td")
-                  if len(tds) >= 9:
-                      name_a = tds[1].find("a")
-                      if not name_a:
-                          continue
-                      
-                      name = name_a.text.strip()
-                      if not name or any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "레버리지", "인버스"]):
-                          continue
-                      
-                      code = name_a['href'].split('code=')[-1]
-                      cur_price = tds[2].text.strip()
-                      rate = tds[4].text.strip()
-                      
-                      try:
-                          total_vol = int(tds[5].text.replace(",", ""))
-                          net_buy_vol = int(tds[6].text.replace(",", ""))
-                          net_buy_amt = int(tds[7].text.replace(",", ""))
-                      except:
-                          continue
 
-                      # 핵심 알파 지표: 거래량 점유율 (Volume Participation Rate)
-                      # 당일 총 거래량 중 해당 주체가 잡아먹은 물량 비율
-                      vpr = round((net_buy_vol / total_vol) * 100, 2) if total_vol > 0 else 0
-                      
-                      data_list.append({
-                          "종목명": name,
-                          "종목코드": code,
-                          "현재가": cur_price,
-                          "등락률": rate,
-                          "총거래량": total_vol,
-                          "순매수량": net_buy_vol,
-                          "순매수대금(백만)": net_buy_amt,
-                          "거래량점유율(VPR)": vpr
-                      })
-                      
+              for i, match in enumerate(matches):
                   if len(data_list) >= top_n:
                       break
 
-              df = pd.DataFrame(data_list)
+                  code = match.group(1)
+                  name = match.group(2).strip()
+                  if not name or any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "레버리지", "인버스"]):
+                      continue
+
+                  start = match.end()
+                  end = matches[i + 1].start() if i + 1 < len(matches) else start + 1500
+                  chunk = html_text[start:end]
+
+                  clean_chunk = re.sub(r'<[^>]+>', ' ', chunk).replace('&nbsp;', ' ')
+                  tokens = [t.strip() for t in clean_chunk.split() if t.strip()]
+
+                  cur_price = tokens[0] if len(tokens) > 0 else "-"
+                  rate = next((t for t in tokens if "%" in t), "-")
+                  num_tokens = [t for t in tokens if re.search(r'\d', t) and "%" not in t]
+
+                  raw_vol = num_tokens[-2] if len(num_tokens) >= 3 else (tokens[3] if len(tokens) > 3 else "0")
+                  raw_amt = num_tokens[-1] if len(num_tokens) >= 2 else (tokens[-1] if tokens else "0")
+
+                  net_vol = int(re.sub(r'[^\d]', '', raw_vol)) if re.sub(r'[^\d]', '', raw_vol) else 0
+                  clean_amt = re.sub(r'[^\d.]', '', raw_amt)
+                  amt_100m = f"{round(float(clean_amt) / 100, 1):,}억" if clean_amt else raw_amt
+
+                  # 개별 종목 당일 총 거래량 수집 후 점유율(VPR) 계산
+                  total_vol = fetch_stock_total_volume(code)
+                  vpr = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
+
+                  data_list.append({
+                      "종목명": name,
+                      "종목코드": code,
+                      "현재가": cur_price,
+                      "등락률": rate,
+                      "총거래량": f"{total_vol:,}주" if total_vol > 0 else "-",
+                      "순매수량": f"{net_vol:,}주",
+                      "순매수대금": amt_100m,
+                      "거래량점유율(VPR)": vpr
+                  })
+
+              df = pd.DataFrame(data_list, columns=cols)
               if not df.empty:
-                  # 거래대금이 아닌 '거래량 점유율(VPR)' 순으로 재정렬하여 시장 통제력 확인
                   df = df.sort_values(by="거래량점유율(VPR)", ascending=False).reset_index(drop=True)
               return df
 
-          print("1. 사모펀드/연기금 당일 거래량 점유율(VPR) 퀀트 데이터 스크리닝 중...")
-          df_pef_kospi = fetch_quant_deal_rank(1, 8000)
-          df_pef_kosdaq = fetch_quant_deal_rank(2, 8000)
-          df_pension_kospi = fetch_quant_deal_rank(1, 7000)
-          df_pension_kosdaq = fetch_quant_deal_rank(2, 7000)
+          print("1. 사모펀드 / 연기금 거래량 점유율(VPR) 데이터 수집 및 퀀트 연산 중...")
+          df_pef_kospi = fetch_quant_rank(1, 8000, top_n=6)
+          df_pef_kosdaq = fetch_quant_rank(2, 8000, top_n=6)
+          df_pension_kospi = fetch_quant_rank(1, 7000, top_n=6)
+          df_pension_kosdaq = fetch_quant_rank(2, 7000, top_n=6)
 
-          # 최상위 통제력(VPR 상위) 3종목씩 압축
-          pef_top = pd.concat([df_pef_kospi.head(3), df_pef_kosdaq.head(3)]).sort_values(by="거래량점유율(VPR)", ascending=False)
-          pension_top = pd.concat([df_pension_kospi.head(3), df_pension_kosdaq.head(3)]).sort_values(by="거래량점유율(VPR)", ascending=False)
+          pef_combined = pd.concat([df_pef_kospi, df_pef_kosdaq], ignore_index=True)
+          pension_combined = pd.concat([df_pension_kospi, df_pension_kosdaq], ignore_index=True)
+
+          pef_top = pef_combined.sort_values(by="거래량점유율(VPR)", ascending=False).head(3) if not pef_combined.empty else pd.DataFrame()
+          pension_top = pension_combined.sort_values(by="거래량점유율(VPR)", ascending=False).head(3) if not pension_combined.empty else pd.DataFrame()
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
 
           # -------------------------------------------------------------
-          # 2. Gemini AI 퀀트 프롬프트 (리딩방 금지, 객관적 지표 중심)
+          # 2. Gemini AI 퀀트 데스크 분석 프롬프트 (리딩방 금지, 드라이한 팩트)
           # -------------------------------------------------------------
           prompt = f"""
-          오늘({today}) 사모펀드(8000) 및 연기금(7000)의 '거래량 점유율(VPR)' 데이터다. 
-          VPR(Volume Participation Rate)은 당일 총 거래량 중 해당 기관이 흡수한 순매수 물량의 비중(%)을 뜻한다. 높을수록 주가 통제력이 강하다.
+          오늘({today}) 국내 증시 사모펀드(8000) 및 연기금(7000)의 '거래량 점유율(VPR)' 분석 데이터다.
+          VPR(Volume Participation Rate) = (기관 순매수량 / 당일 총거래량) * 100.
+          당일 유통된 총 거래량 중 해당 기관이 직접 흡수한 비중을 나타내며, 수치가 높을수록 해당 주체의 호가창 장악력이 높음을 의미한다.
 
-          [사모펀드 VPR 최상위 종목]
+          [사모펀드 VPR 상위 종목]
           {pef_top.to_string(index=False)}
 
-          [연기금 VPR 최상위 종목]
+          [연기금 VPR 상위 종목]
           {pension_top.to_string(index=False)}
 
-          [★ 절대 엄수: 리포트 톤앤매너 ★]
-          1. 리딩방 스타일의 단어(지지선, 저항선, 손절가, 목표가, 매수 타점, 경계령 등)를 **절대** 사용하지 마라.
-          2. 철저하게 여의도 퀀트 리서치 데스크의 드라이(Dry)하고 팩트 중심적인 톤을 유지해라.
-          3. 'VPR(수급 점유율)'과 '거래대금'이 겹치는 종목이 시장 미시구조(Microstructure) 측면에서 어떤 매물 장악력을 가졌는지 객관적 데이터로만 서술해라.
-          4. 텔레그램 가독성을 위해 문단 사이 '빈 줄(줄바꿈 2번)'을 반드시 넣어라.
-          5. <code>, ```, 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목/소제목은 <b>텍스트</b>만 사용.
+          [★ 톤앤매너 및 작성 원칙 - 절대 준수 ★]
+          1. 리딩방 스타일의 표현(지지선, 저항선, 손절가, 목표가, 매수 타점, 진입 구간 등)을 일체 사용하지 마라.
+          2. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 데이터와 시장 미시구조(Microstructure) 사실만 서술해라.
+          3. 텔레그램 모바일 가독성을 위해 문단과 종목 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 유지해라.
+          4. <code> 태그, 백틱(```), 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지.
+          5. 강조 제목과 소제목은 오직 <b>텍스트</b> 태그만 사용해라.
+          6. 단독 < 또는 > 기호는 절대 쓰지 마라. (텔레그램 HTML 파싱 오류 방지)
 
           [★ 출력 레이아웃 템플릿 ★]
-          <b>📊 [{today}] 퀀트 수급 요약: 스마트머니 점유율(VPR) 분석</b>
+          <b>📊 [{today}] 퀀트 수급 브리핑: 기관 거래량 점유율(VPR)</b>
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>1. 📌 당일 시장 미시구조 (Microstructure) 특징</b>
+          <b>1. 📌 당일 시장 미시구조 (Microstructure)</b>
 
-          • 사모펀드 및 연기금의 자금 쏠림과 호가창 점유율(VPR) 기반의 시장 팩트 요약 (2줄 이내)
+          • 사모펀드 및 연기금의 총거래량 대비 순매수 집중도와 자금 성격 요약 (2줄 이내)
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>2. 🎯 사모펀드 (Fast Money) 시장 통제력 상위</b>
+          <b>2. 🎯 사모펀드 (Fast Money) 거래량 장악 상위</b>
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 장악력:</b> 순매수대금 OOO백만 / 거래량 점유율(VPR) O.O%
-          • <b>데이터 해석:</b> VPR 수치를 기반으로 한 사모펀드의 매물대 흡수 강도와 변동성 요약 (드라이한 팩트 1줄)
+          • <b>수급 데이터:</b> 순매수 OOO억 / 총 거래량 대비 점유율(VPR) O.O%
+          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 및 특징 (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 장악력:</b> 순매수대금 OOO백만 / 거래량 점유율(VPR) O.O%
-          • <b>데이터 해석:</b> VPR 수치를 기반으로 한 사모펀드의 매물대 흡수 강도와 변동성 요약 (드라이한 팩트 1줄)
+          • <b>수급 데이터:</b> 순매수 OOO억 / 총 거래량 대비 점유율(VPR) O.O%
+          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 및 특징 (객관적 팩트 1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 장악력:</b> 순매수대금 OOO백만 / 거래량 점유율(VPR) O.O%
-          • <b>데이터 해석:</b> VPR 수치를 기반으로 한 사모펀드의 매물대 흡수 강도와 변동성 요약 (드라이한 팩트 1줄)
+          • <b>수급 데이터:</b> 순매수 OOO억 / 총 거래량 대비 점유율(VPR) O.O%
+          • <b>데이터 진단:</b> VPR 수치 기반의 단기 유통 물량 흡수 강도 및 특징 (객관적 팩트 1줄)
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>3. 🛡️ 연기금 (Slow Money) 매물 흡수 상위</b>
+          <b>3. 🛡️ 연기금 (Slow Money) 매물 잠금 상위</b>
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 장악력:</b> 순매수대금 OOO백만 / 거래량 점유율(VPR) O.O%
-          • <b>데이터 해석:</b> VPR 수치를 기반으로 한 연기금의 중장기 물량 잠금(Lock-in) 특성 요약 (드라이한 팩트 1줄)
+          • <b>수급 데이터:</b> 순매수 OOO억 / 총 거래량 대비 점유율(VPR) O.O%
+          • <b>데이터 진단:</b> VPR 수치 기반의 중장기 물량 잠금(Lock-in) 특성 (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 장악력:</b> 순매수대금 OOO백만 / 거래량 점유율(VPR) O.O%
-          • <b>데이터 해석:</b> VPR 수치를 기반으로 한 연기금의 중장기 물량 잠금(Lock-in) 특성 요약 (드라이한 팩트 1줄)
+          • <b>수급 데이터:</b> 순매수 OOO억 / 총 거래량 대비 점유율(VPR) O.O%
+          • <b>데이터 진단:</b> VPR 수치 기반의 중장기 물량 잠금(Lock-in) 특성 (객관적 팩트 1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 장악력:</b> 순매수대금 OOO백만 / 거래량 점유율(VPR) O.O%
-          • <b>데이터 해석:</b> VPR 수치를 기반으로 한 연기금의 중장기 물량 잠금(Lock-in) 특성 요약 (드라이한 팩트 1줄)
+          • <b>수급 데이터:</b> 순매수 OOO억 / 총 거래량 대비 점유율(VPR) O.O%
+          • <b>데이터 진단:</b> VPR 수치 기반의 중장기 물량 잠금(Lock-in) 특성 (객관적 팩트 1줄)
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>4. 💡 퀀트 데스크 요약 (Quant Summary)</b>
+          <b>4. 💡 퀀트 데스크 특이사항 (Quant Notes)</b>
 
-          • 통계적 이상치(아웃라이어)를 보인 종목이나 기관의 매수 강도(VPR)가 가격 상승률 대비 과도/과소하게 나타난 이상 현상 팩트 리포팅 (2줄 이내)
+          • 총 거래량 대비 기관 매수 비중(VPR)이 비정상적으로 높게 형성된 종목군 또는 수급 이상치 요약 (2줄 이내)
           """
 
           gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-2.5-flash:generateContent"
@@ -204,7 +228,7 @@ jobs:
           max_retries = 3
 
           for attempt in range(1, max_retries + 1):
-              print(f"2. Gemini 퀀트 분석 중... (시도 {attempt}/{max_retries})")
+              print(f"2. Gemini 퀀트 리포트 생성 중... (시도 {attempt}/{max_retries})")
               try:
                   g_res = requests.post(
                       gemini_api_url,
@@ -216,8 +240,10 @@ jobs:
                   if g_res.status_code == 200:
                       report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
                       break
+                  else:
+                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
               except Exception as e:
-                  pass
+                  print(f"Gemini 예외: {e}")
               time.sleep(3)
 
           if not report_text:
@@ -229,7 +255,7 @@ jobs:
           # -------------------------------------------------------------
           # 3. 채널 발송
           # -------------------------------------------------------------
-          print(f"3. {chat_id} 채널로 발송...")
+          print(f"3. {chat_id} 채널로 발송 시작...")
           tg_send_url = f"{tg_base_url}/sendMessage"
 
           def send_to_telegram(msg_text):
@@ -244,17 +270,25 @@ jobs:
                       "disable_web_page_preview": True
                   }, timeout=15)
 
-                  if res.status_code != 200:
+                  if res.status_code == 200:
+                      print(f"[{idx+1}/{len(chunks)}] ✅ 채널 발송 성공!")
+                  else:
+                      print(f"[{idx+1}/{len(chunks)}] HTML 전송 실패 -> 일반 텍스트 재전송...")
                       plain_chunk = re.sub(r'<[^>]+>', '', chunk)
-                      res_fallback = requests.post(tg_send_url, json={"chat_id": chat_id, "text": plain_chunk}, timeout=15)
+                      res_fallback = requests.post(tg_send_url, json={
+                          "chat_id": chat_id,
+                          "text": plain_chunk,
+                          "disable_web_page_preview": True
+                      }, timeout=15)
                       if res_fallback.status_code != 200:
                           success = False
               return success
 
           if not send_to_telegram(report_text):
+              print("❌ 에러: 채널 발송 실패")
               sys.exit(1)
 
-          print(f"🎉 퀀트 리포트 발송 완료!")
+          print("🎉 VPR 기반 퀀트 수급 리포트 발송 완료!")
           EOF
 
           python run_agent.py
