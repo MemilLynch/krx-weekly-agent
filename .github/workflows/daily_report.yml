@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 메이저 수급 분석 및 봇 채널 무음 발송
+      - name: 메이저 수급 분석 및 텔레그램 무음 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -36,7 +36,7 @@ jobs:
           import pandas as pd
 
           # -------------------------------------------------------------
-          # 0. 환경변수 및 전송 대상 설정 (Secrets의 TELEGRAM_CHAT_ID 사용)
+          # 0. 환경변수 검증
           # -------------------------------------------------------------
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -50,7 +50,7 @@ jobs:
               bot_token = bot_token[3:]
 
           if not gemini_key or not bot_token or not chat_id:
-              print("❌ 환경변수 오류: GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 중 누락된 값이 있습니다.")
+              print("❌ 환경변수 오류: GitHub Secrets(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)를 확인하세요.")
               sys.exit(1)
 
           HTTP_SCHEME = "https://"
@@ -65,7 +65,7 @@ jobs:
           }
 
           # -------------------------------------------------------------
-          # 1. 상장주식수 조회 함수
+          # 1. 상장주식수 조회
           # -------------------------------------------------------------
           def fetch_total_shares(code):
               try:
@@ -85,7 +85,7 @@ jobs:
               return 0
 
           # -------------------------------------------------------------
-          # 2. 외국인(9000) / 기관(1000) 실데이터 수집 및 수급 지표 연산
+          # 2. 외국인/기관 순매수 수집 및 거래량 비중 연산
           # -------------------------------------------------------------
           def fetch_market_rank(mkt_gb, investor_gubun, top_n=15):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
@@ -146,7 +146,6 @@ jobs:
               return pd.DataFrame(data_list)
 
           print("1. 네이버 금융에서 외국인/기관 수급 데이터 수집 중...")
-          # 외국인(9000), 기관(1000) | 코스피(1), 코스닥(2)
           df_frgn_kospi = fetch_market_rank(1, 9000, top_n=12)
           df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=12)
           df_inst_kospi = fetch_market_rank(1, 1000, top_n=12)
@@ -155,13 +154,9 @@ jobs:
           df_frgn_all = pd.concat([df_frgn_kospi, df_frgn_kosdaq], ignore_index=True)
           df_inst_all = pd.concat([df_inst_kospi, df_inst_kosdaq], ignore_index=True)
 
-          # 1. 외국인 거래량 비중 상위 3종목
           df_frgn_top = df_frgn_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True)
-
-          # 2. 기관 거래량 비중 상위 3종목
           df_inst_top = df_inst_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True)
 
-          # 3. 외인·기관 동시 순매수(쌍끌이) 상위 2종목 결합
           df_dual = pd.DataFrame()
           if not df_frgn_all.empty and not df_inst_all.empty:
               merged = pd.merge(
@@ -176,14 +171,14 @@ jobs:
                   df_dual = merged.sort_values(by='합산순매수대금', ascending=False).head(2).reset_index(drop=True)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"✅ 수집 성공: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건 확인")
+          print(f"✅ 수집 완료: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건")
 
           # -------------------------------------------------------------
           # 3. Gemini AI 팩트 기반 퀀트 브리핑 생성
           # -------------------------------------------------------------
           prompt = f"""
           오늘({today}) 국내 증시 외국인 및 기관 공식 수급 집계 데이터다.
-          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 주체가 순매수한 수량의 비율(%). 당일 유통 거래 중 매수 집중도를 의미.
+          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 주체가 순매수한 수량의 비율(%).
           - 상장주식수 대비 비중: 전체 상장주식수 대비 당일 순매수한 주식의 비율(%).
 
           [외국인 거래량 비중 상위 3종목]
@@ -198,7 +193,7 @@ jobs:
           [★ 작성 원칙 및 서식 ★]
           1. 임의의 억지 약어(VPR 등) 절대 사용 금지.
           2. 리딩방 스타일(지지선, 저항선, 손절가, 목표가, 추천, 진입 타점 등) 표현 일체 금지.
-          3. 증권사 퀀트 리서치 센터의 객관적이고 드라이(Dry)한 어조로 수치와 거래 팩트만 서술할 것.
+          3. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 수치와 거래 팩트만 서술할 것.
           4. 텔레그램 모바일 가독성을 위해 각 섹션 및 각 종목(■ 1., ■ 2., ■ 3.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣을 것.
           5. <code>, ```, 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목 및 강조는 <b>텍스트</b> 태그만 사용.
           6. 단독 < 또는 > 기호는 절대 쓰지 말 것. (텔레그램 HTML 오류 방지)
@@ -219,4 +214,140 @@ jobs:
           • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+
+          <b>■ 3. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>3. 🛡️ 기관 순매수 비중 상위</b>
+
+          <b>■ 1. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 매수 특성 (객관적 팩트 1줄)
+
+          <b>■ 2. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 매수 특성 (객관적 팩트 1줄)
+
+          <b>■ 3. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 매수 특성 (객관적 팩트 1줄)
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>4. 🔥 외인·기관 동시 순매수 (쌍끌이 집중)</b>
+
+          <b>■ 1. 종목명 (현재가 / 등락률)</b>
+          • <b>합산 수급:</b> 외국인 OOO억 + 기관 OOO억 (합산 OOO억 / 거래량 대비 O.O%)
+          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 및 수급 쏠림 분석 (객관적 팩트 1줄)
+
+          <b>■ 2. 종목명 (현재가 / 등락률)</b>
+          • <b>합산 수급:</b> 외국인 OOO억 + 기관 OOO억 (합산 OOO억 / 거래량 대비 O.O%)
+          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 및 수급 쏠림 분석 (객관적 팩트 1줄)
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>5. 💡 수급 특이사항 요약</b>
+
+          • 총 거래량 대비 메이저 수급 집중도가 높게 나타난 종목군 및 시장 쏠림 현상 정리 (2줄 이내)
+          """
+
+          gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          report_text = None
+          max_retries = 3
+
+          for attempt in range(1, max_retries + 1):
+              print(f"2. Gemini 리포트 생성 중... (시도 {attempt}/{max_retries})")
+              try:
+                  g_res = requests.post(
+                      gemini_api_url,
+                      params={"key": gemini_key},
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps(payload),
+                      timeout=90
+                  )
+                  if g_res.status_code == 200:
+                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      break
+                  else:
+                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
+              except Exception as e:
+                  print(f"Gemini 호출 오류: {e}")
+              time.sleep(3)
+
+          if not report_text:
+              print("❌ Gemini 리포트 생성 실패")
+              sys.exit(1)
+
+          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
+          report_text = re.sub(r'(━━━━━━━━━━━━━━━━━━━)(\s*)([1-5]\.)', r'\1\n\n<b>\3', report_text)
+          report_text = re.sub(r'([^\n])(\s*)(■ \d\.)', r'\1\n\n\3', report_text)
+
+          # -------------------------------------------------------------
+          # 4. 무음 분할 전송 엔진 (HTML 실패 시 순수 텍스트 자동 폴백)
+          # -------------------------------------------------------------
+          print(f"3. 텔레그램 무음 메시지 발송 시작 (대상 Chat ID: {chat_id})...")
+          tg_send_url = f"{tg_base_url}/sendMessage"
+
+          # 3,500자 단위 안전 분할
+          def split_message(text, max_len=3500):
+              chunks = []
+              while len(text) > max_len:
+                  split_idx = text.rfind('\n\n', 0, max_len)
+                  if split_idx == -1:
+                      split_idx = text.rfind('\n', 0, max_len)
+                  if split_idx == -1:
+                      split_idx = max_len
+                  chunks.append(text[:split_idx].strip())
+                  text = text[split_idx:].strip()
+              if text:
+                  chunks.append(text)
+              return chunks
+
+          chunks = split_message(report_text)
+          all_success = True
+
+          for idx, chunk in enumerate(chunks):
+              # 1차 시도: HTML 파싱 모드 + 무음 전송
+              payload = {
+                  "chat_id": chat_id,
+                  "text": chunk,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True,
+                  "disable_notification": True
+              }
+              res = requests.post(tg_send_url, json=payload, timeout=15)
+              res_data = res.json()
+
+              if res.status_code == 200 and res_data.get("ok"):
+                  c_title = res_data["result"].get("chat", {}).get("title", res_data["result"].get("chat", {}).get("first_name", "대화방"))
+                  print(f"[{idx+1}/{len(chunks)}] ✅ 무음 발송 성공! (방: {c_title})")
+              else:
+                  print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 전송 실패 -> 일반 텍스트 모드로 즉시 재전송...")
+                  # 2차 시도: 모든 HTML 태그 제거 후 순수 텍스트 모드로 무조건 발송
+                  plain_chunk = re.sub(r'<[^>]+>', '', chunk)
+                  fallback_payload = {
+                      "chat_id": chat_id,
+                      "text": plain_chunk,
+                      "disable_web_page_preview": True,
+                      "disable_notification": True
+                  }
+                  f_res = requests.post(tg_send_url, json=fallback_payload, timeout=15)
+                  f_data = f_res.json()
+                  if f_res.status_code == 200 and f_data.get("ok"):
+                      print(f"[{idx+1}/{len(chunks)}] ✅ 일반 텍스트 무음 발송 성공!")
+                  else:
+                      print(f"[{idx+1}/{len(chunks)}] ❌ 전송 최종 실패: {f_data.get('description', f_res.text)}")
+                      all_success = False
+
+          if not all_success:
+              print("❌ 텔레그램 메시지 전송 실패. Chat ID와 봇 권한을 확인하세요.")
+              sys.exit(1)
+
+          print("🎉 리포트 무음 발송 프로세스 완료!")
+          EOF
+
+          python run_agent.py
