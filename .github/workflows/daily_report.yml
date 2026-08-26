@@ -15,10 +15,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 필수 라이브러리 설치 (lxml 추가)
-        run: pip install requests beautifulsoup4 pandas lxml
+      - name: 필수 라이브러리 설치
+        run: pip install requests beautifulsoup4 pandas
 
-      - name: 메이저 수급 분석 및 무음 발송
+      - name: 메이저 수급 실데이터 분석 및 텔레그램 무음 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -30,126 +30,130 @@ jobs:
           from bs4 import BeautifulSoup
 
           # -------------------------------------------------------------
-          # 0. 환경변수 검증
+          # 0. 내부 통제: 환경변수 및 세션 초기화
           # -------------------------------------------------------------
-          raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
-          raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+          gemini_key = os.getenv("GEMINI_API_KEY", "").strip('\'"')
+          bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('\'"')
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
 
-          gemini_key = raw_gemini_key.strip().strip("'").strip('"')
-          bot_token = raw_bot_token.strip().strip("'").strip('"')
-          chat_id = raw_chat_id.strip().strip("'").strip('"')
+          if bot_token.lower().startswith("bot"): bot_token = bot_token[3:]
 
           if not gemini_key or not bot_token or not chat_id:
-              print("❌ 환경변수 오류: GitHub Secrets 확인 필수.")
+              print("❌ 내부 통제 실패: 환경변수(Secrets) 누락")
               sys.exit(1)
 
-          if bot_token.lower().startswith("bot"):
-              bot_token = bot_token[3:]
-
-          HTTP_SCHEME = "https://"
-          NAVER_DOMAIN = "finance.naver.com"
-          GEMINI_DOMAIN = "generativelanguage.googleapis.com"
-          TG_DOMAIN = "api.telegram.org"
-          tg_base_url = f"{HTTP_SCHEME}{TG_DOMAIN}/bot{bot_token}"
+          HTTP = "https://"
+          NAVER = "finance.naver.com"
+          tg_base_url = f"{HTTP}api.telegram.org/bot{bot_token}"
 
           session = requests.Session()
           session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
           # -------------------------------------------------------------
-          # 1. 완벽한 표(Table) 추출 엔진 (read_html 적용)
+          # 1. 검증된 파라미터 적용 및 밀림 방지 파싱
           # -------------------------------------------------------------
-          def get_market_rank(sosok, investor_gubun):
-              url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&sosok={sosok}"
+          def get_market_rank(mkt_gb, investor_gubun):
+              url = f"{HTTP}{NAVER}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               r = session.get(url, timeout=10)
-              r.encoding = 'euc-kr'
-              
-              # 종목코드 매핑용
-              soup = BeautifulSoup(r.text, 'html.parser')
-              code_map = {}
-              for a in soup.find_all('a', href=True):
-                  if 'code=' in a['href']:
-                      code_map[a.text.strip()] = a['href'].split('code=')[-1]
-              
-              # pandas로 표 통째로 읽기 (태그 개수 세는 오류 원천 차단)
-              try:
-                  dfs = pd.read_html(r.text)
-                  if not dfs: return pd.DataFrame()
-                  df = dfs[0]
-              except:
-                  return pd.DataFrame()
-              
-              df = df.dropna(subset=['종목명']).copy()
-              df = df[~df['종목명'].str.contains('TIGER|KODEX|ACE|RISE|SOL|PLUS|KBSTAR|KOSEF|스팩|레버리지|인버스|ETN')]
-              
-              df['종목코드'] = df['종목명'].map(code_map)
-              df = df.dropna(subset=['종목코드']).copy()
-              
-              # 숫자 정제
-              df['현재가'] = pd.to_numeric(df['현재가'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-              df['순매수량'] = pd.to_numeric(df['순매수량'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-              df['순매수대금'] = pd.to_numeric(df['순매수대금'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-              
-              # 순매수가 발생한 유효 종목만 리턴
-              return df[(df['순매수량'] > 0) & (df['순매수대금'] > 0)]
+              soup = BeautifulSoup(r.content.decode("cp949", errors="ignore"), "html.parser")
 
-          print("1. 네이버 금융에서 외국인/기관 수급 실데이터 추출 중...")
-          df_f1 = get_market_rank('01', '9000')  # 코스피 외인
-          df_f2 = get_market_rank('02', '9000')  # 코스닥 외인
-          df_frgn = pd.concat([df_f1, df_f2], ignore_index=True)
+              data_list = []
+              for tr in soup.find_all("tr"):
+                  tds = tr.find_all("td")
+                  # 네이버 테이블 정규 칸수(7칸) 엄격 검증
+                  if len(tds) < 7: continue
 
-          df_i1 = get_market_rank('01', '1000')  # 코스피 기관
-          df_i2 = get_market_rank('02', '1000')  # 코스닥 기관
-          df_inst = pd.concat([df_i1, df_i2], ignore_index=True)
+                  a_tag = tds[1].find("a")
+                  if not a_tag: continue
+
+                  name = a_tag.text.strip()
+                  # ETF, ETN, 인버스 등 패시브 펀드 엄격 필터링
+                  if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN"]):
+                      continue
+
+                  code = a_tag['href'].split('code=')[-1]
+
+                  try:
+                      price_str = tds[2].text.replace(',', '').strip()
+                      rate = tds[4].text.strip()
+                      net_vol_str = tds[5].text.replace(',', '').strip()
+                      net_amt_str = tds[6].text.replace(',', '').strip()
+
+                      # 데이터 무결성 1차 검증 (숫자 형태인가?)
+                      if not (price_str.isdigit() and net_vol_str.lstrip('-').isdigit() and net_amt_str.lstrip('-').isdigit()):
+                          continue
+
+                      price = int(price_str)
+                      net_vol = int(net_vol_str)
+                      net_amt_mil = int(net_amt_str) # 백만원 단위
+
+                      # 데이터 무결성 2차 검증 (가격이 비정상적으로 낮거나 순매수량이 0 이하인가?)
+                      # 97원 등의 파싱 오류 원천 차단
+                      if price < 100 or net_vol <= 0 or net_amt_mil <= 0:
+                          continue
+
+                      data_list.append({
+                          "종목명": name, "종목코드": code, "현재가": price, "등락률": rate,
+                          "순매수량": net_vol, "순매수대금": net_amt_mil
+                      })
+                  except Exception as e:
+                      continue
+              return data_list
+
+          print("1. 외인/기관 순매수 데이터 안전 추출 중...")
+          frgn_data = get_market_rank('1', '9000') + get_market_rank('2', '9000')
+          inst_data = get_market_rank('1', '1000') + get_market_rank('2', '1000')
+
+          df_frgn = pd.DataFrame(frgn_data)
+          df_inst = pd.DataFrame(inst_data)
 
           # -------------------------------------------------------------
-          # 2. 거래량 및 상장주식수 단일 추출
+          # 2. 메타데이터(거래량) 최소화 추출 (차단 회피)
           # -------------------------------------------------------------
-          def get_meta(code):
+          def get_meta_data(code):
               try:
-                  url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
+                  url = f"{HTTP}{NAVER}/item/main.naver?code={code}"
                   r = session.get(url, timeout=5)
-                  html = r.text
                   
-                  vol_match = re.search(r'id="_quant"[^>]*>([\d,]+)', html)
+                  # 강력한 정규식으로 거래량과 상장주식수 동시 획득
+                  vol_match = re.search(r'id="_quant"[^>]*>([\d,]+)', r.text)
                   vol = int(vol_match.group(1).replace(',', '')) if vol_match else 0
                   
-                  share_match = re.search(r'상장주식수.*?([\d,]+)', html)
+                  share_match = re.search(r'상장주식수.*?([\d,]+)', r.text)
                   shares = int(share_match.group(1).replace(',', '')) if share_match else 0
                   
                   return vol, shares
               except:
                   return 0, 0
 
-          def process_top(df):
+          def process_top_stocks(df):
               if df.empty: return pd.DataFrame()
               
-              # 순매수대금 상위 5종목만 추려서 메타데이터(거래량/주식수) 조회
+              # 서버 부하 방지를 위해 순매수대금 상위 5종목만 메타 조회
               top_df = df.sort_values(by='순매수대금', ascending=False).head(5).copy()
               results = []
               
               for _, r in top_df.iterrows():
-                  vol, shares = get_meta(r['종목코드'])
+                  t_vol, t_shares = get_meta_data(r['종목코드'])
                   amt_억 = round(r['순매수대금'] / 100, 1)
-                  v_ratio = round((r['순매수량'] / vol) * 100, 2) if vol > 0 else 0.0
-                  s_ratio = round((r['순매수량'] / shares) * 100, 3) if shares > 0 else 0.0
+                  vol_ratio = round((r['순매수량'] / t_vol) * 100, 2) if t_vol > 0 else 0.0
+                  share_ratio = round((r['순매수량'] / t_shares) * 100, 3) if t_shares > 0 else 0.0
                   
                   results.append({
-                      '종목명': r['종목명'], 
-                      '현재가': int(r['현재가']), 
-                      '등락률': str(r['등락률']).strip(),
-                      'v_ratio': v_ratio,
-                      '포맷': f"{r['종목명']} ({int(r['현재가']):,}원 / {str(r['등락률']).strip()}) | 순매수 {amt_억:,}억 | 거래량대비 {v_ratio}% | 상장주식수대비 {s_ratio}%"
+                      "종목명": r['종목명'], "종목코드": r['종목코드'], "현재가": r['현재가'], "등락률": r['등락률'],
+                      "순매수대금_억": amt_억, "순매수량": r['순매수량'], "거래량비중": vol_ratio,
+                      # AI 할루시네이션 방지용 고정 문자열
+                      "포맷_텍스트": f"{r['종목명']} ({r['현재가']:,}원 / {r['등락률']}) | 순매수 {amt_억:,}억 | 거래량대비 {vol_ratio}% | 상장주식수대비 {share_ratio}%"
                   })
               
               res_df = pd.DataFrame(results)
-              # 최종 출력은 거래량 비중 순 상위 3종목
-              return res_df.sort_values(by='v_ratio', ascending=False).head(3)
+              # 거래량 대비 비중(집중도) 순으로 최종 3종목 정렬
+              return res_df.sort_values(by='거래량비중', ascending=False).head(3).reset_index(drop=True)
 
-          df_frgn_top = process_top(df_frgn)
-          df_inst_top = process_top(df_inst)
+          print("2. 거래량 비중 연산 (최소 통신)...")
+          df_frgn_top = process_top_stocks(df_frgn)
+          df_inst_top = process_top_stocks(df_inst)
 
-          # 쌍끌이(동시매수) 교차 분석
           df_dual = pd.DataFrame()
           if not df_frgn.empty and not df_inst.empty:
               merged = pd.merge(df_frgn, df_inst, on=['종목코드', '종목명', '현재가', '등락률'], suffixes=('_f', '_i'))
@@ -158,183 +162,136 @@ jobs:
                   merged['합산수량'] = merged['순매수량_f'] + merged['순매수량_i']
                   
                   top_dual = merged.sort_values(by='합산대금', ascending=False).head(2)
-                  d_results = []
-                  
+                  dual_res = []
                   for _, r in top_dual.iterrows():
-                      vol, _ = get_meta(r['종목코드'])
+                      t_vol, _ = get_meta_data(r['종목코드'])
                       amt_억 = round(r['합산대금'] / 100, 1)
-                      v_ratio = round((r['합산수량'] / vol) * 100, 2) if vol > 0 else 0.0
+                      vol_ratio = round((r['합산수량'] / t_vol) * 100, 2) if t_vol > 0 else 0.0
                       
-                      d_results.append({
-                          '포맷': f"{r['종목명']} ({int(r['현재가']):,}원 / {str(r['등락률']).strip()}) | 합산 {amt_억:,}억 | 거래량대비 {v_ratio}%"
+                      dual_res.append({
+                          "쌍끌이_텍스트": f"{r['종목명']} ({r['현재가']:,}원 / {r['등락률']}) | 합산 {amt_억:,}억 | 거래량대비 {vol_ratio}%"
                       })
-                  df_dual = pd.DataFrame(d_results)
+                  df_dual = pd.DataFrame(dual_res)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"✅ 데이터 추출 성공: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건 정상 산출")
+          print(f"✅ 연산 완료: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건")
 
           # -------------------------------------------------------------
-          # 3. Gemini AI 프롬프트 생성 (AI 할루시네이션 원천 차단)
+          # 3. Gemini 프롬프트 전송 (문자열 강제 주입 방식)
           # -------------------------------------------------------------
-          frgn_text = "\n".join([f"{i+1}. {r['포맷']}" for i, r in df_frgn_top.iterrows()]) if not df_frgn_top.empty else "당일 집계된 상위 종목 없음"
-          inst_text = "\n".join([f"{i+1}. {r['포맷']}" for i, r in df_inst_top.iterrows()]) if not df_inst_top.empty else "당일 집계된 상위 종목 없음"
-          dual_text = "\n".join([f"{i+1}. {r['포맷']}" for i, r in df_dual.iterrows()]) if not df_dual.empty else "당일 외인·기관 동시 매집 상위 종목 없음"
+          frgn_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_frgn_top.iterrows()]) if not df_frgn_top.empty else "데이터 없음"
+          inst_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_inst_top.iterrows()]) if not df_inst_top.empty else "데이터 없음"
+          dual_str = "\n".join([f"{i+1}. {r['쌍끌이_텍스트']}" for i, r in df_dual.iterrows()]) if not df_dual.empty else "쌍끌이 종목 없음"
 
           prompt = f"""
-          오늘({today}) 국내 증시 외국인 및 기관 수급 분석 데이터다.
+          오늘({today}) 국내 증시 기관/외국인 수급 팩트 데이터다.
 
-          [외국인 거래량 비중 상위 3종목]
-          {frgn_text}
+          [외국인 수급 상위 3종목]
+          {frgn_str}
 
-          [기관 거래량 비중 상위 3종목]
-          {inst_text}
+          [기관 수급 상위 3종목]
+          {inst_str}
 
-          [외인·기관 동시 순매수(쌍끌이) 종목]
-          {dual_text}
+          [외인·기관 동시 순매수]
+          {dual_str}
 
-          [★ 작성 원칙 및 서식 ★]
-          1. 위에서 제공한 텍스트 줄을 한 글자도 바꾸지 말고 그대로 복사해서 써라. AI가 임의로 숫자를 지어내면 절대 안 된다.
-          2. 리딩방 스타일(지지선, 저항선, 손절가, 추천 등) 표현 일체 금지.
-          3. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 수치 팩트만 서술해라.
-          4. 모바일 가독성을 위해 각 섹션과 종목(■ 1., ■ 2., ■ 3.) 사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣어라.
-          5. <code>, ```, 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목 및 강조는 <b>텍스트</b> 태그만 사용해라.
-          6. 단독 < 또는 > 기호는 절대 쓰지 마라.
+          [★ 엄격 통제 지시사항 ★]
+          1. 위에서 제공된 종목명, 가격, 비중 숫자를 단 하나도 바꾸거나 지어내지 말고 100% 똑같이 복사해서 써라.
+          2. 데이터가 없으면 억지로 분석하지 말고 '당일 집계 종목 없음'이라고 명시해라.
+          3. 증권사 리서치 데스크의 드라이(Dry)한 어조로 팩트만 서술해라.
+          4. 각 섹션(■ 1., ■ 2.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣어라. (텔레그램 가독성 필수)
+          5. 마크다운 표, <code>, ``` 금지. 제목 및 강조는 <b>텍스트</b> 태그만 써라.
 
-          [★ 출력 레이아웃 템플릿 ★]
+          [★ 출력 템플릿 ★]
           <b>📊 [{today}] 외국인·기관 수급 분석 브리핑</b>
 
           ━━━━━━━━━━━━━━━━━━━
           <b>1. 📌 당일 시장 수급 동향</b>
-
-          • 외국인 및 기관의 총 거래량 대비 순매수 집중도 팩트 요약 (2줄 이내)
+          • (수급 집중도에 대한 1~2줄 요약)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>2. 🎯 외국인 순매수 비중 상위</b>
-          (※ 종목이 없으면 '당일 집계 종목 없음' 메시지 하나만 출력)
+          (※ 데이터 없으면 '당일 집계 종목 없음' 한 줄만 출력)
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 유통물량 흡수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 유통물량 흡수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> (객관적 팩트 1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 유통물량 흡수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> (객관적 팩트 1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>3. 🛡️ 기관 순매수 비중 상위</b>
-          (※ 종목이 없으면 '당일 집계 종목 없음' 메시지 하나만 출력)
-
-          <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 매수 특성 (객관적 팩트 1줄)
-
-          <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 매수 특성 (객관적 팩트 1줄)
-
-          <b>■ 3. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 매수 특성 (객관적 팩트 1줄)
+          (※ 데이터 없으면 '당일 집계 종목 없음' 한 줄만 출력)
+          (위 외국인 템플릿과 동일하게 1, 2, 3위 작성)
 
           ━━━━━━━━━━━━━━━━━━━
-          <b>4. 🔥 외인·기관 동시 순매수 (쌍끌이 집중)</b>
-          (※ 데이터가 없으면 '당일 동시 매집 상위 종목 없음' 한 줄만 출력)
+          <b>4. 🔥 외인·기관 동시 순매수 (쌍끌이)</b>
+          (※ 데이터 없으면 '당일 동시 매집 종목 없음' 한 줄만 출력)
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>합산 수급:</b> 합산 OOO억 / 거래량 대비 O.O%
-          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 요약 (1줄)
-
-          <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>합산 수급:</b> 합산 OOO억 / 거래량 대비 O.O%
-          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 요약 (1줄)
+          • <b>수급 팩트:</b> (객관적 팩트 1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>5. 💡 수급 특이사항 요약</b>
-
-          • 오늘 쏠림 현상이 강했던 종목이나 섹터에 대한 사실 기반 브리핑 (2줄 이내)
+          • (오늘 장 수급 특징 사실 기반 1~2줄 요약)
           """
 
-          gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
+          gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent?key={gemini_key}"
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
-          report_text = None
+          report_text = ""
           for attempt in range(1, 4):
-              print(f"3. Gemini 리포트 생성 중... (시도 {attempt}/3)")
               try:
-                  g_res = requests.post(
-                      gemini_api_url,
-                      params={"key": gemini_key},
-                      headers={"Content-Type": "application/json"},
-                      data=json.dumps(payload),
-                      timeout=90
-                  )
-                  if g_res.status_code == 200:
-                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                  res = requests.post(gemini_url, json=payload, timeout=60)
+                  if res.status_code == 200:
+                      report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
                       break
-              except Exception as e:
-                  print(f"Gemini 호출 오류: {e}")
+              except: pass
               time.sleep(3)
 
-          if not report_text:
-              print("❌ Gemini 리포트 생성 실패")
-              sys.exit(1)
+          if not report_text: sys.exit(1)
 
-          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
+          report_text = report_text.replace("```html", "").replace("```", "").strip()
           report_text = re.sub(r'(━━━━━━━━━━━━━━━━━━━)(\s*)([1-5]\.)', r'\1\n\n<b>\3', report_text)
           report_text = re.sub(r'([^\n])(\s*)(■ \d\.)', r'\1\n\n\3', report_text)
 
           # -------------------------------------------------------------
-          # 4. 무음 분할 텔레그램 전송 엔진
+          # 4. 텔레그램 무음 및 분할 전송
           # -------------------------------------------------------------
-          print(f"4. 텔레그램 무음 메시지 발송 시작 (대상 Chat ID: {chat_id})...")
-          tg_send_url = f"{tg_base_url}/sendMessage"
-
-          def split_message(text, max_len=3500):
-              chunks = []
-              while len(text) > max_len:
-                  split_idx = text.rfind('\n\n', 0, max_len)
-                  if split_idx == -1: split_idx = text.rfind('\n', 0, max_len)
-                  if split_idx == -1: split_idx = max_len
-                  chunks.append(text[:split_idx].strip())
-                  text = text[split_idx:].strip()
-              if text: chunks.append(text)
-              return chunks
-
-          chunks = split_message(report_text)
-          all_success = True
-
-          for idx, chunk in enumerate(chunks):
-              payload = {
-                  "chat_id": chat_id,
-                  "text": chunk,
-                  "parse_mode": "HTML",
-                  "disable_web_page_preview": True,
-                  "disable_notification": True
-              }
-              res = requests.post(tg_send_url, json=payload, timeout=15)
-              res_data = res.json()
-
-              if res.status_code == 200 and res_data.get("ok"):
-                  print(f"[{idx+1}/{len(chunks)}] ✅ 무음 발송 성공!")
-              else:
-                  print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 -> 일반 텍스트 재전송...")
-                  plain_chunk = re.sub(r'<[^>]+>', '', chunk)
-                  f_res = requests.post(tg_send_url, json={
-                      "chat_id": chat_id, "text": plain_chunk,
+          print("3. 텔레그램 무음 메시지 발송...")
+          def send_tg(text):
+              try:
+                  # 1차 시도 (HTML 포맷팅 + 무음 전송)
+                  r = requests.post(tg_base_url + "/sendMessage", json={
+                      "chat_id": chat_id, "text": text, "parse_mode": "HTML",
                       "disable_web_page_preview": True, "disable_notification": True
                   }, timeout=15)
-                  if not (f_res.status_code == 200 and f_res.json().get("ok")):
-                      all_success = False
+                  if r.json().get("ok"): return True
+                  
+                  # 2차 시도 (HTML 태그 에러 시 일반 텍스트로 무조건 발송)
+                  plain_text = re.sub(r'<[^>]+>', '', text)
+                  r = requests.post(tg_base_url + "/sendMessage", json={
+                      "chat_id": chat_id, "text": plain_text,
+                      "disable_web_page_preview": True, "disable_notification": True
+                  }, timeout=15)
+                  return r.json().get("ok")
+              except: return False
 
-          if not all_success:
-              print("❌ 텔레그램 메시지 전송 실패.")
-              sys.exit(1)
+          # 본문이 길 경우 자르기 로직
+          chunks = [report_text[i:i+3500] for i in range(0, len(report_text), 3500)]
+          for chunk in chunks:
+              if not send_tg(chunk):
+                  print("❌ 텔레그램 전송 실패")
+                  sys.exit(1)
 
-          print("🎉 실데이터 기반 수급 리포트 무음 발송 완료!")
+          print("🎉 검증 완료: 정상 데이터 무음 발송 완료")
           EOF
 
           python run_agent.py
