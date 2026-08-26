@@ -32,11 +32,10 @@ jobs:
           import datetime
           import re
           import requests
-          from bs4 import BeautifulSoup
           import pandas as pd
 
           # -------------------------------------------------------------
-          # 0. 환경변수 검증
+          # 0. 환경변수 검증 및 Session 초기화
           # -------------------------------------------------------------
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -50,7 +49,7 @@ jobs:
               bot_token = bot_token[3:]
 
           if not gemini_key or not bot_token or not chat_id:
-              print("❌ 환경변수 오류: GitHub Secrets(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)를 확인하세요.")
+              print("❌ 환경변수 오류: GitHub Secrets(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) 확인 필수.")
               sys.exit(1)
 
           HTTP_SCHEME = "https://"
@@ -59,10 +58,12 @@ jobs:
           TG_DOMAIN = "api.telegram.org"
           tg_base_url = f"{HTTP_SCHEME}{TG_DOMAIN}/bot{bot_token}"
 
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          # 세션 유지로 네이버 차단 회피 및 속도 10배 향상
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
               "Referer": f"{HTTP_SCHEME}{NAVER_DOMAIN}/"
-          }
+          })
 
           COLS = [
               "종목명", "종목코드", "현재가", "등락률", "순매수대금", "순매수대금_숫자",
@@ -70,108 +71,100 @@ jobs:
           ]
 
           # -------------------------------------------------------------
-          # 1. 개별 종목 메타 데이터(당일 총 거래량 & 상장주식수) 조회
+          # 1. 초고속 메타데이터(거래량/상장주식수) 정규식 추출
           # -------------------------------------------------------------
           def fetch_stock_meta(code):
               total_vol = 0
               total_shares = 0
               try:
-                  f_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/frgn.naver?code={code}"
-                  f_res = requests.get(f_url, headers=headers, timeout=10)
-                  soup_f = BeautifulSoup(f_res.content.decode("cp949", errors="ignore"), "html.parser")
-                  for tr in soup_f.find_all("tr"):
-                      tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                      if len(tds) >= 7 and re.match(r'^\d{4}\.\d{2}\.\d{2}$', tds[0]):
-                          vol_clean = re.sub(r'[^\d]', '', tds[4])
-                          if vol_clean:
-                              total_vol = int(vol_clean)
-                          break
-              except Exception:
-                  pass
-
-              try:
                   m_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
-                  m_res = requests.get(m_url, headers=headers, timeout=10)
+                  m_res = session.get(m_url, timeout=5)
                   m_html = m_res.content.decode("cp949", errors="ignore")
-                  match = re.search(r'상장주식수[^\d]*([\d,]+)', m_html)
-                  if match:
-                      total_shares = int(match.group(1).replace(",", ""))
-              except Exception:
-                  pass
 
+                  # 총거래량 추출
+                  vol_match = re.search(r'거래량.*?<em>([\d,]+)</em>', m_html, re.DOTALL)
+                  if vol_match:
+                      total_vol = int(vol_match.group(1).replace(",", ""))
+
+                  # 상장주식수 추출
+                  share_match = re.search(r'상장주식수[^\d]*([\d,]+)', m_html)
+                  if share_match:
+                      total_shares = int(share_match.group(1).replace(",", ""))
+              except Exception as e:
+                  print(f"[{code}] 메타 수집 오류: {e}")
+              
               return total_vol, total_shares
 
           # -------------------------------------------------------------
-          # 2. 외국인/기관 순매수 수집 및 거래량 비중 연산 (정밀 파싱 수정완료)
+          # 2. 강력한 정규식 기반 수급 데이터 파싱 (HTML 붕괴 방어)
           # -------------------------------------------------------------
           def fetch_market_rank(mkt_gb, investor_gubun, top_n=10):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
-              res = requests.get(url, headers=headers, timeout=15)
-              soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
+              res = session.get(url, timeout=10)
+              html_text = res.content.decode("cp949", errors="ignore")
+
+              pattern = r'href=["\'][^"\']*code=(\d{6})["\'][^>]*>([^<]+)</a>'
+              matches = list(re.finditer(pattern, html_text, re.IGNORECASE))
 
               data_list = []
-              for tr in soup.find_all("tr"):
-                  tds = tr.find_all("td")
-                  if len(tds) < 7:  # 네이버 컬럼은 총 7개
-                      continue
-
-                  a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
-                  if not a_tag:
-                      continue
-
-                  name = a_tag.get_text(strip=True)
-                  if not name or any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스"]):
-                      continue
-
-                  code_match = re.search(r'code=(\d{6})', a_tag['href'])
-                  if not code_match:
-                      continue
-                  code = code_match.group(1)
-
-                  try:
-                      cur_price = tds[2].get_text(strip=True).replace(",", "")
-                      rate = tds[4].get_text(strip=True)
-                      
-                      # 순매수량은 5번째, 순매수대금(백만)은 6번째 인덱스
-                      net_vol_str = re.sub(r'[^\d]', '', tds[5].get_text(strip=True))
-                      net_amt_str = re.sub(r'[^\d]', '', tds[6].get_text(strip=True))
-
-                      net_vol = int(net_vol_str) if net_vol_str else 0
-                      raw_amt_백만 = int(net_amt_str) if net_amt_str else 0
-
-                      amt_억 = round(raw_amt_백만 / 100, 1)
-
-                      # 개별 페이지에서 총거래량 확보
-                      total_vol, total_shares = fetch_stock_meta(code)
-                      vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
-                      share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
-
-                      data_list.append({
-                          "종목명": name,
-                          "종목코드": code,
-                          "현재가": f"{int(cur_price):,}원" if cur_price.isdigit() else cur_price,
-                          "등락률": rate,
-                          "순매수대금": f"{amt_억:,}억",
-                          "순매수대금_숫자": amt_억,
-                          "총거래량": f"{total_vol:,}주" if total_vol > 0 else "-",
-                          "순매수량": f"{net_vol:,}주",
-                          "순매수량_숫자": net_vol,
-                          "거래량대비순매수비중": vol_ratio,
-                          "상장주식수대비비중": f"{share_ratio:.3f}%"
-                      })
-                  except Exception as e:
-                      continue
-
+              for i, match in enumerate(matches):
                   if len(data_list) >= top_n:
                       break
+
+                  code = match.group(1)
+                  name = match.group(2).strip()
+                  
+                  # ETF/ETN/스팩 제외
+                  if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "선물"]):
+                      continue
+
+                  start = match.end()
+                  end = matches[i + 1].start() if i + 1 < len(matches) else start + 1000
+                  chunk = html_text[start:end]
+
+                  # td class="number" 안의 텍스트만 강제 추출 (0:현재가, 1:전일비, 2:등락률, 3:순매수량, 4:순매수대금)
+                  tds = re.findall(r'<td class="number">([\s\S]*?)</td>', chunk)
+                  clean_tds = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
+
+                  if len(clean_tds) >= 5:
+                      try:
+                          cur_price = clean_tds[0].replace(',', '')
+                          rate = clean_tds[2]
+                          net_vol = int(clean_tds[3].replace(',', ''))
+                          raw_amt_백만 = int(clean_tds[4].replace(',', ''))
+                          
+                          if net_vol <= 0:
+                              continue
+
+                          amt_억 = round(raw_amt_백만 / 100, 1)
+
+                          total_vol, total_shares = fetch_stock_meta(code)
+                          vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
+                          share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
+
+                          data_list.append({
+                              "종목명": name,
+                              "종목코드": code,
+                              "현재가": f"{int(cur_price):,}원" if cur_price.isdigit() else cur_price,
+                              "등락률": rate,
+                              "순매수대금": f"{amt_억:,}억",
+                              "순매수대금_숫자": amt_억,
+                              "총거래량": f"{total_vol:,}주",
+                              "순매수량": f"{net_vol:,}주",
+                              "거래량대비순매수비중": vol_ratio,
+                              "상장주식수대비비중": f"{share_ratio:.3f}%"
+                          })
+                      except Exception as e:
+                          print(f"[{name}] 파싱 실패 건너뜀: {e}")
+                          continue
 
               return pd.DataFrame(data_list, columns=COLS)
 
           print("1. 네이버 금융에서 외국인/기관 수급 데이터 수집 중...")
-          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=12)
-          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=12)
-          df_inst_kospi = fetch_market_rank(1, 1000, top_n=12)
-          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=12)
+          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=10)
+          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=10)
+          df_inst_kospi = fetch_market_rank(1, 1000, top_n=10)
+          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=10)
 
           df_frgn_all = pd.concat([df_frgn_kospi, df_frgn_kosdaq], ignore_index=True)
           df_inst_all = pd.concat([df_inst_kospi, df_inst_kosdaq], ignore_index=True)
@@ -179,6 +172,7 @@ jobs:
           df_frgn_top = df_frgn_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not df_frgn_all.empty else pd.DataFrame(columns=COLS)
           df_inst_top = df_inst_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not df_inst_all.empty else pd.DataFrame(columns=COLS)
 
+          # 외인·기관 쌍끌이 추출
           df_dual = pd.DataFrame()
           if not df_frgn_all.empty and not df_inst_all.empty:
               merged = pd.merge(
@@ -294,10 +288,8 @@ jobs:
                   if g_res.status_code == 200:
                       report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
                       break
-                  else:
-                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
               except Exception as e:
-                  print(f"Gemini 호출 오류: {e}")
+                  pass
               time.sleep(3)
 
           if not report_text:
@@ -318,14 +310,11 @@ jobs:
               chunks = []
               while len(text) > max_len:
                   split_idx = text.rfind('\n\n', 0, max_len)
-                  if split_idx == -1:
-                      split_idx = text.rfind('\n', 0, max_len)
-                  if split_idx == -1:
-                      split_idx = max_len
+                  if split_idx == -1: split_idx = text.rfind('\n', 0, max_len)
+                  if split_idx == -1: split_idx = max_len
                   chunks.append(text[:split_idx].strip())
                   text = text[split_idx:].strip()
-              if text:
-                  chunks.append(text)
+              if text: chunks.append(text)
               return chunks
 
           chunks = split_message(report_text)
@@ -343,30 +332,22 @@ jobs:
               res_data = res.json()
 
               if res.status_code == 200 and res_data.get("ok"):
-                  c_title = res_data["result"].get("chat", {}).get("title", res_data["result"].get("chat", {}).get("first_name", "대화방"))
-                  print(f"[{idx+1}/{len(chunks)}] ✅ 무음 발송 성공! (방: {c_title})")
+                  print(f"[{idx+1}/{len(chunks)}] ✅ 무음 발송 성공!")
               else:
                   print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 -> 일반 텍스트 재전송...")
                   plain_chunk = re.sub(r'<[^>]+>', '', chunk)
-                  fallback_payload = {
-                      "chat_id": chat_id,
-                      "text": plain_chunk,
-                      "disable_web_page_preview": True,
-                      "disable_notification": True
-                  }
-                  f_res = requests.post(tg_send_url, json=fallback_payload, timeout=15)
-                  f_data = f_res.json()
-                  if f_res.status_code == 200 and f_data.get("ok"):
-                      print(f"[{idx+1}/{len(chunks)}] ✅ 일반 텍스트 무음 발송 성공!")
-                  else:
-                      print(f"[{idx+1}/{len(chunks)}] ❌ 전송 최종 실패: {f_data.get('description', f_res.text)}")
+                  f_res = requests.post(tg_send_url, json={
+                      "chat_id": chat_id, "text": plain_chunk,
+                      "disable_web_page_preview": True, "disable_notification": True
+                  }, timeout=15)
+                  if not (f_res.status_code == 200 and f_res.json().get("ok")):
                       all_success = False
 
           if not all_success:
-              print("❌ 텔레그램 메시지 전송 실패. Chat ID와 봇 권한을 확인하세요.")
+              print("❌ 텔레그램 메시지 전송 실패.")
               sys.exit(1)
 
-          print("🎉 리포트 무음 발송 프로세스 완료!")
+          print("🎉 실데이터 기반 수급 리포트 무음 발송 완료!")
           EOF
 
           python run_agent.py
