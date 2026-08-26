@@ -36,17 +36,16 @@ jobs:
           import pandas as pd
 
           # -------------------------------------------------------------
-          # 0. 전송 대상 채널 설정 (@MemilLynch)
+          # 0. 전송 대상 설정
           # -------------------------------------------------------------
           TARGET_CHANNEL = "@MemilLynch"
 
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+          raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip("'").strip('"')
 
           gemini_key = raw_gemini_key.strip().strip("'").strip('"')
           bot_token = raw_bot_token.strip().strip("'").strip('"')
-          chat_id = TARGET_CHANNEL if TARGET_CHANNEL else raw_chat_id.strip().strip("'").strip('"')
 
           if bot_token.lower().startswith("bot"):
               bot_token = bot_token[3:]
@@ -67,7 +66,7 @@ jobs:
           }
 
           # -------------------------------------------------------------
-          # 1. 상장주식수 조회 함수
+          # 1. 상장주식수 조회
           # -------------------------------------------------------------
           def fetch_total_shares(code):
               try:
@@ -87,7 +86,7 @@ jobs:
               return 0
 
           # -------------------------------------------------------------
-          # 2. 사모펀드/연기금 수급 데이터 및 공식 지표 연산
+          # 2. 사모펀드/연기금 수급 원천 데이터 수집
           # -------------------------------------------------------------
           def fetch_institutional_data(mkt_gb, investor_gubun, top_n=10):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
@@ -120,13 +119,9 @@ jobs:
                       net_vol = int(tds[6].get_text(strip=True).replace(",", ""))
                       raw_amt_백만 = int(tds[7].get_text(strip=True).replace(",", ""))
                       
-                      # 백만원 -> 억원 변환
                       amt_억 = round(raw_amt_백만 / 100, 1)
-
-                      # 당일 총 거래량 대비 순매수 비중 (%)
                       volume_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
 
-                      # 상장주식수 대비 지분율 (%)
                       total_shares = fetch_total_shares(code)
                       share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
 
@@ -150,7 +145,6 @@ jobs:
               return pd.DataFrame(data_list)
 
           print("1. 네이버 금융에서 사모펀드 / 연기금 수급 원천 데이터 수집 중...")
-          # 8000: 사모펀드, 7000: 연기금 | 1: 코스피, 2: 코스닥
           df_pef_kospi = fetch_institutional_data(1, 8000, top_n=6)
           df_pef_kosdaq = fetch_institutional_data(2, 8000, top_n=6)
           df_pension_kospi = fetch_institutional_data(1, 7000, top_n=6)
@@ -159,7 +153,6 @@ jobs:
           pef_combined = pd.concat([df_pef_kospi, df_pef_kosdaq], ignore_index=True)
           pension_combined = pd.concat([df_pension_kospi, df_pension_kosdaq], ignore_index=True)
 
-          # 거래량 대비 순매수 비중 기준 상위 3종목 선별
           pef_top = pef_combined.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not pef_combined.empty else pd.DataFrame()
           pension_top = pension_combined.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not pension_combined.empty else pd.DataFrame()
 
@@ -171,7 +164,7 @@ jobs:
           # -------------------------------------------------------------
           prompt = f"""
           오늘({today}) 국내 증시 사모펀드 및 연기금 수급 집계 데이터다.
-          - 거래량 대비 순매수 비중: 당일 발생한 총 거래량 중 해당 기관이 순매수한 수량의 비율(%). 당일 유통 거래 중 해당 주체의 매수 장악력을 나타냄.
+          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 기관이 순매수한 수량의 비율(%).
           - 상장주식수 대비 비중: 전체 상장주식수 대비 당일 순매수한 주식의 비율(%).
 
           [사모펀드 거래량 비중 상위 3종목]
@@ -201,4 +194,109 @@ jobs:
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+
+          <b>■ 2. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+
+          <b>■ 3. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>3. 🛡️ 연기금 순매수 비중 상위</b>
+
+          <b>■ 1. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 중장기 매수 특성 (객관적 팩트 1줄)
+
+          <b>■ 2. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 중장기 매수 특성 (객관적 팩트 1줄)
+
+          <b>■ 3. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
+          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 중장기 매수 특성 (객관적 팩트 1줄)
+
+          ━━━━━━━━━━━━━━━━━━━
+          <b>4. 💡 수급 특이사항 요약</b>
+
+          • 총 거래량 대비 기관 순매수 집중도가 높게 나타난 종목군 및 시장 수급 쏠림 현상 정리 (2줄 이내)
+          """
+
+          gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
+          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          report_text = None
+          max_retries = 3
+
+          for attempt in range(1, max_retries + 1):
+              print(f"2. Gemini 리포트 생성 중... (시도 {attempt}/{max_retries})")
+              try:
+                  g_res = requests.post(
+                      gemini_api_url,
+                      params={"key": gemini_key},
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps(payload),
+                      timeout=90
+                  )
+                  if g_res.status_code == 200:
+                      report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      break
+                  else:
+                      print(f"Gemini API 에러 ({g_res.status_code}): {g_res.text}")
+              except Exception as e:
+                  print(f"Gemini 호출 오류: {e}")
+              time.sleep(3)
+
+          if not report_text:
+              print("❌ Gemini 리포트 생성 실패")
+              sys.exit(1)
+
+          report_text = report_text.replace("```html", "").replace("```", "").replace("<code>", "").replace("</code>", "").strip()
+          report_text = re.sub(r'(━━━━━━━━━━━━━━━━━━━)(\s*)([1-4]\.)', r'\1\n\n<b>\3', report_text)
+          report_text = re.sub(r'([^\n])(\s*)(■ \d\.)', r'\1\n\n\3', report_text)
+
+          # -------------------------------------------------------------
+          # 4. 정밀 전송 엔진 (채널 발송 시도 후 상세 로그 출력)
+          # -------------------------------------------------------------
+          def send_msg(dest_id, text_content):
+              url = f"{tg_base_url}/sendMessage"
+              res = requests.post(url, json={
+                  "chat_id": dest_id,
+                  "text": text_content,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True
+              }, timeout=15)
+              
+              res_data = res.json()
+              if res.status_code == 200 and res_data.get("ok"):
+                  chat_info = res_data["result"].get("chat", {})
+                  c_title = chat_info.get("title", chat_info.get("first_name", "Unknown"))
+                  c_type = chat_info.get("type", "unknown")
+                  c_id = chat_info.get("id", "unknown")
+                  print(f"✅ 전송 성공! -> 방 이름: [{c_title}], 타입: [{c_type}], ID: [{c_id}]")
+                  return True
+              else:
+                  err_desc = res_data.get("description", res.text)
+                  print(f"⚠️ 전송 실패 (대상: {dest_id}) -> 원인: {err_desc}")
+                  return False
+
+          print(f"3. 텔레그램 메시지 발송 시작...")
+          # 1순위: @MemilLynch 채널로 발송
+          sent = send_msg(TARGET_CHANNEL, report_text)
+
+          # 채널 발송 실패 시 Secrets에 저장된 개인 Chat ID로 비상 발송
+          if not sent and raw_chat_id:
+              print(f"🔄 '{TARGET_CHANNEL}' 발송 실패로 인해 Secrets의 TELEGRAM_CHAT_ID({raw_chat_id})로 재전송 시도...")
+              sent = send_msg(raw_chat_id, report_text)
+
+          if not sent:
+              print("❌ 텔레그램 최종 발송 실패. 봇 권한 또는 채널 아이디를 확인하세요.")
+              sys.exit(1)
+
+          print("🎉 리포트 발송 프로세스 완료!")
+          EOF
+
+          python run_agent.py
