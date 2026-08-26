@@ -32,10 +32,11 @@ jobs:
           import datetime
           import re
           import requests
+          from bs4 import BeautifulSoup
           import pandas as pd
 
           # -------------------------------------------------------------
-          # 0. 환경변수 검증 및 Session 초기화
+          # 0. 환경변수 검증
           # -------------------------------------------------------------
           raw_gemini_key = os.getenv("GEMINI_API_KEY", "")
           raw_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -49,7 +50,7 @@ jobs:
               bot_token = bot_token[3:]
 
           if not gemini_key or not bot_token or not chat_id:
-              print("❌ 환경변수 오류: GitHub Secrets(GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) 확인 필수.")
+              print("❌ 환경변수 오류: GitHub Secrets 확인 필수.")
               sys.exit(1)
 
           HTTP_SCHEME = "https://"
@@ -58,161 +59,154 @@ jobs:
           TG_DOMAIN = "api.telegram.org"
           tg_base_url = f"{HTTP_SCHEME}{TG_DOMAIN}/bot{bot_token}"
 
-          # 세션 유지로 네이버 차단 회피 및 속도 10배 향상
           session = requests.Session()
           session.headers.update({
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
               "Referer": f"{HTTP_SCHEME}{NAVER_DOMAIN}/"
           })
 
-          COLS = [
-              "종목명", "종목코드", "현재가", "등락률", "순매수대금", "순매수대금_숫자",
-              "총거래량", "순매수량", "순매수량_숫자", "거래량대비순매수비중", "상장주식수대비비중"
-          ]
-
           # -------------------------------------------------------------
-          # 1. 초고속 메타데이터(거래량/상장주식수) 정규식 추출
+          # 1. 상장주식수 조회 (정밀 탐색)
           # -------------------------------------------------------------
-          def fetch_stock_meta(code):
-              total_vol = 0
-              total_shares = 0
+          def fetch_total_shares(code):
               try:
-                  m_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
-                  m_res = session.get(m_url, timeout=5)
-                  m_html = m_res.content.decode("cp949", errors="ignore")
-
-                  # 총거래량 추출
-                  vol_match = re.search(r'거래량.*?<em>([\d,]+)</em>', m_html, re.DOTALL)
-                  if vol_match:
-                      total_vol = int(vol_match.group(1).replace(",", ""))
-
-                  # 상장주식수 추출
-                  share_match = re.search(r'상장주식수[^\d]*([\d,]+)', m_html)
-                  if share_match:
-                      total_shares = int(share_match.group(1).replace(",", ""))
-              except Exception as e:
-                  print(f"[{code}] 메타 수집 오류: {e}")
-              
-              return total_vol, total_shares
+                  url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
+                  res = session.get(url, timeout=5)
+                  soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
+                  th = soup.find('th', string=re.compile('상장주식수'))
+                  if th:
+                      td = th.find_next_sibling('td')
+                      if td:
+                          return int(re.sub(r'[^\d]', '', td.text))
+              except:
+                  pass
+              return 0
 
           # -------------------------------------------------------------
-          # 2. 강력한 정규식 기반 수급 데이터 파싱 (HTML 붕괴 방어)
+          # 2. 강력한 DOM 파싱 기반 수급 수집 (컬럼 밀림 현상 완벽 제거)
           # -------------------------------------------------------------
-          def fetch_market_rank(mkt_gb, investor_gubun, top_n=10):
+          def fetch_market_rank(mkt_gb, investor_gubun, top_n=15):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = session.get(url, timeout=10)
-              html_text = res.content.decode("cp949", errors="ignore")
-
-              pattern = r'href=["\'][^"\']*code=(\d{6})["\'][^>]*>([^<]+)</a>'
-              matches = list(re.finditer(pattern, html_text, re.IGNORECASE))
+              soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
 
               data_list = []
-              for i, match in enumerate(matches):
-                  if len(data_list) >= top_n:
-                      break
+              # 네이버 iframe 테이블 구조: 0:순위, 1:종목명, 2:현재가, 3:전일비, 4:등락률, 5:거래량, 6:순매수량, 7:순매수대금
+              for tr in soup.find_all("tr"):
+                  tds = tr.find_all("td")
+                  if len(tds) < 8:
+                      continue
 
-                  code = match.group(1)
-                  name = match.group(2).strip()
-                  
-                  # ETF/ETN/스팩 제외
+                  a_tag = tds[1].find("a")
+                  if not a_tag:
+                      continue
+
+                  name = a_tag.text.strip()
                   if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "선물"]):
                       continue
 
-                  start = match.end()
-                  end = matches[i + 1].start() if i + 1 < len(matches) else start + 1000
-                  chunk = html_text[start:end]
+                  code = a_tag['href'].split('code=')[-1]
 
-                  # td class="number" 안의 텍스트만 강제 추출 (0:현재가, 1:전일비, 2:등락률, 3:순매수량, 4:순매수대금)
-                  tds = re.findall(r'<td class="number">([\s\S]*?)</td>', chunk)
-                  clean_tds = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
+                  try:
+                      # 텍스트 추출 후 쉼표 제거 및 정수 변환
+                      price_text = tds[2].text.replace(',', '').strip()
+                      rate = tds[4].text.strip()
+                      total_vol_text = tds[5].text.replace(',', '').strip()
+                      net_vol_text = tds[6].text.replace(',', '').strip()
+                      net_amt_text = tds[7].text.replace(',', '').strip()
 
-                  if len(clean_tds) >= 5:
-                      try:
-                          cur_price = clean_tds[0].replace(',', '')
-                          rate = clean_tds[2]
-                          net_vol = int(clean_tds[3].replace(',', ''))
-                          raw_amt_백만 = int(clean_tds[4].replace(',', ''))
-                          
-                          if net_vol <= 0:
-                              continue
-
-                          amt_억 = round(raw_amt_백만 / 100, 1)
-
-                          total_vol, total_shares = fetch_stock_meta(code)
-                          vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
-                          share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
-
-                          data_list.append({
-                              "종목명": name,
-                              "종목코드": code,
-                              "현재가": f"{int(cur_price):,}원" if cur_price.isdigit() else cur_price,
-                              "등락률": rate,
-                              "순매수대금": f"{amt_억:,}억",
-                              "순매수대금_숫자": amt_억,
-                              "총거래량": f"{total_vol:,}주",
-                              "순매수량": f"{net_vol:,}주",
-                              "거래량대비순매수비중": vol_ratio,
-                              "상장주식수대비비중": f"{share_ratio:.3f}%"
-                          })
-                      except Exception as e:
-                          print(f"[{name}] 파싱 실패 건너뜀: {e}")
+                      # 숫자가 아닌 값이 섞여있으면 스킵
+                      if not (price_text.isdigit() and total_vol_text.isdigit() and net_vol_text.isdigit() and net_amt_text.isdigit()):
                           continue
 
-              return pd.DataFrame(data_list, columns=COLS)
+                      price = int(price_text)
+                      total_vol = int(total_vol_text)
+                      net_vol = int(net_vol_text)
+                      net_amt_mil = int(net_amt_text)
 
-          print("1. 네이버 금융에서 외국인/기관 수급 데이터 수집 중...")
-          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=10)
-          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=10)
-          df_inst_kospi = fetch_market_rank(1, 1000, top_n=10)
-          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=10)
+                      if total_vol <= 0 or net_vol <= 0:
+                          continue
+
+                      amt_억 = round(net_amt_mil / 100, 1)
+                      vol_ratio = round((net_vol / total_vol) * 100, 2)
+
+                      total_shares = fetch_total_shares(code)
+                      share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
+
+                      data_list.append({
+                          "종목명": name,
+                          "종목코드": code,
+                          "현재가": price,
+                          "등락률": rate,
+                          "순매수대금_숫자": amt_억,
+                          "거래량비중": vol_ratio,
+                          "상장주식수비중": share_ratio,
+                          # AI가 상상하지 못하도록 미리 포맷팅된 문자열 생성
+                          "사전포맷": f"{name} ({price:,}원 / {rate}) | 순매수 {amt_억:,}억 | 거래량대비 {vol_ratio}% | 상장주식수대비 {share_ratio}%"
+                      })
+                  except Exception as e:
+                      print(f"[{name}] 파싱 에러: {e}")
+                      continue
+
+              df = pd.DataFrame(data_list)
+              if not df.empty:
+                  # 수급 장악력(거래량 비중) 순으로 내림차순 정렬
+                  df = df.sort_values(by="거래량비중", ascending=False).reset_index(drop=True)
+              return df
+
+          print("1. 네이버 금융에서 외국인/기관 수급 실데이터 추출 중...")
+          df_frgn_kospi = fetch_market_rank(1, 9000)
+          df_frgn_kosdaq = fetch_market_rank(2, 9000)
+          df_inst_kospi = fetch_market_rank(1, 1000)
+          df_inst_kosdaq = fetch_market_rank(2, 1000)
 
           df_frgn_all = pd.concat([df_frgn_kospi, df_frgn_kosdaq], ignore_index=True)
           df_inst_all = pd.concat([df_inst_kospi, df_inst_kosdaq], ignore_index=True)
 
-          df_frgn_top = df_frgn_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not df_frgn_all.empty else pd.DataFrame(columns=COLS)
-          df_inst_top = df_inst_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not df_inst_all.empty else pd.DataFrame(columns=COLS)
+          df_frgn_top = df_frgn_all.sort_values(by="거래량비중", ascending=False).head(3).reset_index(drop=True) if not df_frgn_all.empty else pd.DataFrame()
+          df_inst_top = df_inst_all.sort_values(by="거래량비중", ascending=False).head(3).reset_index(drop=True) if not df_inst_all.empty else pd.DataFrame()
 
-          # 외인·기관 쌍끌이 추출
           df_dual = pd.DataFrame()
           if not df_frgn_all.empty and not df_inst_all.empty:
               merged = pd.merge(
-                  df_frgn_all[['종목명', '종목코드', '현재가', '등락률', '순매수대금', '순매수대금_숫자', '거래량대비순매수비중']],
-                  df_inst_all[['종목코드', '순매수대금', '순매수대금_숫자', '거래량대비순매수비중']],
-                  on='종목코드',
-                  suffixes=('_외국인', '_기관')
+                  df_frgn_all, df_inst_all, on=['종목코드', '종목명', '현재가', '등락률'], suffixes=('_외국인', '_기관')
               )
               if not merged.empty:
                   merged['합산순매수대금'] = merged['순매수대금_숫자_외국인'] + merged['순매수대금_숫자_기관']
-                  merged['합산거래량비중'] = (merged['거래량대비순매수비중_외국인'] + merged['거래량대비순매수비중_기관']).round(2)
+                  merged['합산거래량비중'] = (merged['거래량비중_외국인'] + merged['거래량비중_기관']).round(2)
+                  merged['쌍끌이포맷'] = merged.apply(lambda r: f"{r['종목명']} ({r['현재가']:,}원 / {r['등락률']}) | 합산 {r['합산순매수대금']:,}억 | 거래량대비 {r['합산거래량비중']}%", axis=1)
                   df_dual = merged.sort_values(by='합산순매수대금', ascending=False).head(2).reset_index(drop=True)
 
           today = datetime.datetime.now().strftime("%Y-%m-%d")
-          print(f"✅ 수집 완료: 외국인 {len(df_frgn_top)}건, 기관 {len(df_inst_top)}건, 쌍끌이 {len(df_dual)}건 확인")
+          print(f"✅ 수집 성공: 외국인 {len(df_frgn_top)}종목, 기관 {len(df_inst_top)}종목, 쌍끌이 {len(df_dual)}종목")
 
           # -------------------------------------------------------------
-          # 3. Gemini AI 팩트 기반 퀀트 브리핑 생성
+          # 3. Gemini AI 프롬프트 (사전 포맷팅된 문자열만 주입)
           # -------------------------------------------------------------
+          # 데이터가 비어있을 경우 방어
+          frgn_text = "\n".join([f"{i+1}. {r['사전포맷']}" for i, r in df_frgn_top.iterrows()]) if not df_frgn_top.empty else "집계된 종목 없음"
+          inst_text = "\n".join([f"{i+1}. {r['사전포맷']}" for i, r in df_inst_top.iterrows()]) if not df_inst_top.empty else "집계된 종목 없음"
+          dual_text = "\n".join([f"{i+1}. {r['쌍끌이포맷']}" for i, r in df_dual.iterrows()]) if not df_dual.empty else "쌍끌이 매집 종목 없음"
+
           prompt = f"""
-          오늘({today}) 국내 증시 외국인 및 기관 공식 수급 집계 데이터다.
-          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 주체가 순매수한 수량의 비율(%). 당일 유통 거래 중 매수 집중도를 의미.
-          - 상장주식수 대비 비중: 전체 상장주식수 대비 당일 순매수한 주식의 비율(%).
+          오늘({today}) 국내 증시 외국인 및 기관 수급 분석 데이터다.
 
           [외국인 거래량 비중 상위 3종목]
-          {df_frgn_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False) if not df_frgn_top.empty else "데이터 없음"}
+          {frgn_text}
 
           [기관 거래량 비중 상위 3종목]
-          {df_inst_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False) if not df_inst_top.empty else "데이터 없음"}
+          {inst_text}
 
           [외인·기관 동시 순매수(쌍끌이) 종목]
-          {df_dual[['종목명', '현재가', '등락률', '순매수대금_외국인', '순매수대금_기관', '합산순매수대금', '합산거래량비중']].to_string(index=False) if not df_dual.empty else "당일 양대 주체 동시 상위 매집 종목 없음"}
+          {dual_text}
 
           [★ 작성 원칙 및 서식 ★]
-          1. 임의의 억지 약어(VPR 등) 절대 사용 금지.
-          2. 리딩방 스타일(지지선, 저항선, 손절가, 목표가, 추천, 진입 타점 등) 표현 일체 금지.
-          3. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 수치와 거래 팩트만 서술할 것.
-          4. 텔레그램 모바일 가독성을 위해 각 섹션 및 각 종목(■ 1., ■ 2., ■ 3.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣을 것.
+          1. 내가 제공한 숫자(현재가, 등락률, 순매수대금, 비중)를 절대 변형하거나 지어내지 말고 그대로 사용해라.
+          2. 리딩방 스타일(지지선, 저항선, 손절가, 추천 등) 표현 일체 금지.
+          3. 증권사 퀀트 리서치 데스크의 객관적이고 드라이(Dry)한 어조로 수치 팩트만 서술해라.
+          4. 모바일 가독성을 위해 각 섹션과 종목(■ 1., ■ 2., ■ 3.) 사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣을 것.
           5. <code>, ```, 마크다운 표(|---|), 마크다운 볼드(**) 절대 금지. 제목 및 강조는 <b>텍스트</b> 태그만 사용.
-          6. 단독 < 또는 > 기호는 절대 쓰지 말 것. (텔레그램 HTML 오류 방지)
+          6. 단독 < 또는 > 기호는 절대 쓰지 말 것.
 
           [★ 출력 레이아웃 템플릿 ★]
           <b>📊 [{today}] 외국인·기관 수급 분석 브리핑</b>
@@ -220,63 +214,62 @@ jobs:
           ━━━━━━━━━━━━━━━━━━━
           <b>1. 📌 당일 시장 수급 동향</b>
 
-          • 외국인 및 기관의 총 거래량 대비 순매수 집중도와 시장 수급 특이사항 요약 (2줄 이내)
+          • 외국인 및 기관의 총 거래량 대비 순매수 집중도 요약 (2줄 이내)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>2. 🎯 외국인 순매수 비중 상위</b>
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 유통물량 흡수 특성 (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 유통물량 흡수 특성 (객관적 팩트 1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 유통물량 흡수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 유통물량 흡수 특성 (객관적 팩트 1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>3. 🛡️ 기관 순매수 비중 상위</b>
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 매수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 매수 특성 (객관적 팩트 1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 매수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 매수 특성 (객관적 팩트 1줄)
 
           <b>■ 3. 종목명 (현재가 / 등락률)</b>
           • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> 당일 총 거래량 대비 순매수 비중 및 매수 특성 (객관적 팩트 1줄)
+          • <b>거래 분석:</b> 제공된 수치를 바탕으로 한 매수 특성 (객관적 팩트 1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>4. 🔥 외인·기관 동시 순매수 (쌍끌이 집중)</b>
+          (※ 데이터가 없으면 '당일 동시 매집 상위 종목 없음' 한 줄만 출력)
 
           <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>합산 수급:</b> 외국인 OOO억 + 기관 OOO억 (합산 OOO억 / 거래량 대비 O.O%)
-          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 및 수급 쏠림 분석 (객관적 팩트 1줄)
+          • <b>합산 수급:</b> 합산 OOO억 / 거래량 대비 O.O%
+          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 요약 (1줄)
 
           <b>■ 2. 종목명 (현재가 / 등락률)</b>
-          • <b>합산 수급:</b> 외국인 OOO억 + 기관 OOO억 (합산 OOO억 / 거래량 대비 O.O%)
-          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 및 수급 쏠림 분석 (객관적 팩트 1줄)
+          • <b>합산 수급:</b> 합산 OOO억 / 거래량 대비 O.O%
+          • <b>수급 팩트:</b> 양대 주체의 동시 매집 규모 요약 (1줄)
 
           ━━━━━━━━━━━━━━━━━━━
           <b>5. 💡 수급 특이사항 요약</b>
 
-          • 총 거래량 대비 메이저 수급 집중도가 높게 나타난 종목군 및 시장 쏠림 현상 정리 (2줄 이내)
+          • 오늘 쏠림 현상이 강했던 종목이나 섹터에 대한 사실 기반 브리핑 (2줄 이내)
           """
 
           gemini_api_url = f"{HTTP_SCHEME}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent"
           payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
           report_text = None
-          max_retries = 3
-
-          for attempt in range(1, max_retries + 1):
-              print(f"2. Gemini 리포트 생성 중... (시도 {attempt}/{max_retries})")
+          for attempt in range(1, 4):
+              print(f"2. Gemini 리포트 생성 중... (시도 {attempt}/3)")
               try:
                   g_res = requests.post(
                       gemini_api_url,
@@ -288,8 +281,10 @@ jobs:
                   if g_res.status_code == 200:
                       report_text = g_res.json()["candidates"][0]["content"]["parts"][0]["text"]
                       break
+                  else:
+                      print(f"Gemini API 에러: {g_res.text}")
               except Exception as e:
-                  pass
+                  print(f"Gemini 호출 오류: {e}")
               time.sleep(3)
 
           if not report_text:
