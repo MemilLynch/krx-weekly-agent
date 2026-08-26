@@ -18,7 +18,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas
 
-      - name: 메이저 수급 분석 및 텔레그램 무음 발송
+      - name: 메이저 수급 분석 및 무음 발송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -64,30 +64,47 @@ jobs:
               "Referer": f"{HTTP_SCHEME}{NAVER_DOMAIN}/"
           }
 
-          # -------------------------------------------------------------
-          # 1. 상장주식수 조회
-          # -------------------------------------------------------------
-          def fetch_total_shares(code):
-              try:
-                  url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
-                  res = requests.get(url, headers=headers, timeout=10)
-                  soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
-                  for tr in soup.find_all("tr"):
-                      th = tr.find("th")
-                      if th and "상장주식수" in th.get_text():
-                          td = tr.find("td")
-                          if td:
-                              clean_num = re.sub(r'[^\d]', '', td.get_text())
-                              if clean_num:
-                                  return int(clean_num)
-              except Exception:
-                  pass
-              return 0
+          COLS = [
+              "종목명", "종목코드", "현재가", "등락률", "순매수대금", "순매수대금_숫자",
+              "총거래량", "순매수량", "순매수량_숫자", "거래량대비순매수비중", "상장주식수대비비중"
+          ]
 
           # -------------------------------------------------------------
-          # 2. 외국인/기관 순매수 수집 및 거래량 비중 연산
+          # 1. 개별 종목 메타 데이터(당일 총 거래량 & 상장주식수) 조회
           # -------------------------------------------------------------
-          def fetch_market_rank(mkt_gb, investor_gubun, top_n=15):
+          def fetch_stock_meta(code):
+              total_vol = 0
+              total_shares = 0
+              try:
+                  f_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/frgn.naver?code={code}"
+                  f_res = requests.get(f_url, headers=headers, timeout=10)
+                  soup_f = BeautifulSoup(f_res.content.decode("cp949", errors="ignore"), "html.parser")
+                  for tr in soup_f.find_all("tr"):
+                      tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                      if len(tds) >= 7 and re.match(r'^\d{4}\.\d{2}\.\d{2}$', tds[0]):
+                          vol_clean = re.sub(r'[^\d]', '', tds[4])
+                          if vol_clean:
+                              total_vol = int(vol_clean)
+                          break
+              except Exception:
+                  pass
+
+              try:
+                  m_url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/item/main.naver?code={code}"
+                  m_res = requests.get(m_url, headers=headers, timeout=10)
+                  m_html = m_res.content.decode("cp949", errors="ignore")
+                  match = re.search(r'상장주식수[^\d]*([\d,]+)', m_html)
+                  if match:
+                      total_shares = int(match.group(1).replace(",", ""))
+              except Exception:
+                  pass
+
+              return total_vol, total_shares
+
+          # -------------------------------------------------------------
+          # 2. 외국인/기관 순매수 수집 및 거래량 비중 연산 (정밀 파싱)
+          # -------------------------------------------------------------
+          def fetch_market_rank(mkt_gb, investor_gubun, top_n=10):
               url = f"{HTTP_SCHEME}{NAVER_DOMAIN}/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
               res = requests.get(url, headers=headers, timeout=15)
               soup = BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
@@ -95,7 +112,7 @@ jobs:
               data_list = []
               for tr in soup.find_all("tr"):
                   tds = tr.find_all("td")
-                  if len(tds) < 8:
+                  if len(tds) < 6:
                       continue
 
                   a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
@@ -112,26 +129,29 @@ jobs:
                   code = code_match.group(1)
 
                   try:
-                      cur_price = tds[2].get_text(strip=True).replace(",", "")
+                      cur_price = tds[2].get_text(strip=True)
                       rate = tds[4].get_text(strip=True)
-                      total_vol = int(tds[5].get_text(strip=True).replace(",", ""))
-                      net_vol = int(tds[6].get_text(strip=True).replace(",", ""))
-                      raw_amt_백만 = int(tds[7].get_text(strip=True).replace(",", ""))
+                      
+                      raw_vol_text = re.sub(r'[^\d]', '', tds[5].get_text(strip=True))
+                      raw_amt_text = re.sub(r'[^\d]', '', tds[6].get_text(strip=True)) if len(tds) >= 7 else "0"
+
+                      net_vol = int(raw_vol_text) if raw_vol_text else 0
+                      raw_amt_백만 = int(raw_amt_text) if raw_amt_text else 0
 
                       amt_억 = round(raw_amt_백만 / 100, 1)
-                      vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
 
-                      total_shares = fetch_total_shares(code)
+                      total_vol, total_shares = fetch_stock_meta(code)
+                      vol_ratio = round((net_vol / total_vol) * 100, 2) if total_vol > 0 else 0.0
                       share_ratio = round((net_vol / total_shares) * 100, 3) if total_shares > 0 else 0.0
 
                       data_list.append({
                           "종목명": name,
                           "종목코드": code,
-                          "현재가": f"{int(cur_price):,}원",
+                          "현재가": f"{cur_price}원" if not cur_price.endswith("원") else cur_price,
                           "등락률": rate,
                           "순매수대금": f"{amt_억:,}억",
                           "순매수대금_숫자": amt_억,
-                          "총거래량": f"{total_vol:,}주",
+                          "총거래량": f"{total_vol:,}주" if total_vol > 0 else "-",
                           "순매수량": f"{net_vol:,}주",
                           "순매수량_숫자": net_vol,
                           "거래량대비순매수비중": vol_ratio,
@@ -143,19 +163,19 @@ jobs:
                   if len(data_list) >= top_n:
                       break
 
-              return pd.DataFrame(data_list)
+              return pd.DataFrame(data_list, columns=COLS)
 
           print("1. 네이버 금융에서 외국인/기관 수급 데이터 수집 중...")
-          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=12)
-          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=12)
-          df_inst_kospi = fetch_market_rank(1, 1000, top_n=12)
-          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=12)
+          df_frgn_kospi = fetch_market_rank(1, 9000, top_n=10)
+          df_frgn_kosdaq = fetch_market_rank(2, 9000, top_n=10)
+          df_inst_kospi = fetch_market_rank(1, 1000, top_n=10)
+          df_inst_kosdaq = fetch_market_rank(2, 1000, top_n=10)
 
           df_frgn_all = pd.concat([df_frgn_kospi, df_frgn_kosdaq], ignore_index=True)
           df_inst_all = pd.concat([df_inst_kospi, df_inst_kosdaq], ignore_index=True)
 
-          df_frgn_top = df_frgn_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True)
-          df_inst_top = df_inst_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True)
+          df_frgn_top = df_frgn_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not df_frgn_all.empty else pd.DataFrame(columns=COLS)
+          df_inst_top = df_inst_all.sort_values(by="거래량대비순매수비중", ascending=False).head(3).reset_index(drop=True) if not df_inst_all.empty else pd.DataFrame(columns=COLS)
 
           df_dual = pd.DataFrame()
           if not df_frgn_all.empty and not df_inst_all.empty:
@@ -178,14 +198,14 @@ jobs:
           # -------------------------------------------------------------
           prompt = f"""
           오늘({today}) 국내 증시 외국인 및 기관 공식 수급 집계 데이터다.
-          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 주체가 순매수한 수량의 비율(%).
+          - 거래량 대비 순매수 비중: 당일 총 거래량 중 해당 주체가 순매수한 수량의 비율(%). 당일 유통 거래 중 매수 집중도를 의미.
           - 상장주식수 대비 비중: 전체 상장주식수 대비 당일 순매수한 주식의 비율(%).
 
           [외국인 거래량 비중 상위 3종목]
-          {df_frgn_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False)}
+          {df_frgn_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False) if not df_frgn_top.empty else "데이터 없음"}
 
           [기관 거래량 비중 상위 3종목]
-          {df_inst_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False)}
+          {df_inst_top[['종목명', '현재가', '등락률', '순매수대금', '거래량대비순매수비중', '상장주식수대비비중']].to_string(index=False) if not df_inst_top.empty else "데이터 없음"}
 
           [외인·기관 동시 순매수(쌍끌이) 종목]
           {df_dual[['종목명', '현재가', '등락률', '순매수대금_외국인', '순매수대금_기관', '합산순매수대금', '합산거래량비중']].to_string(index=False) if not df_dual.empty else "당일 양대 주체 동시 상위 매집 종목 없음"}
@@ -287,12 +307,11 @@ jobs:
           report_text = re.sub(r'([^\n])(\s*)(■ \d\.)', r'\1\n\n\3', report_text)
 
           # -------------------------------------------------------------
-          # 4. 무음 분할 전송 엔진 (HTML 실패 시 순수 텍스트 자동 폴백)
+          # 4. 무음 분할 전송 엔진
           # -------------------------------------------------------------
           print(f"3. 텔레그램 무음 메시지 발송 시작 (대상 Chat ID: {chat_id})...")
           tg_send_url = f"{tg_base_url}/sendMessage"
 
-          # 3,500자 단위 안전 분할
           def split_message(text, max_len=3500):
               chunks = []
               while len(text) > max_len:
@@ -311,7 +330,6 @@ jobs:
           all_success = True
 
           for idx, chunk in enumerate(chunks):
-              # 1차 시도: HTML 파싱 모드 + 무음 전송
               payload = {
                   "chat_id": chat_id,
                   "text": chunk,
@@ -326,8 +344,7 @@ jobs:
                   c_title = res_data["result"].get("chat", {}).get("title", res_data["result"].get("chat", {}).get("first_name", "대화방"))
                   print(f"[{idx+1}/{len(chunks)}] ✅ 무음 발송 성공! (방: {c_title})")
               else:
-                  print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 전송 실패 -> 일반 텍스트 모드로 즉시 재전송...")
-                  # 2차 시도: 모든 HTML 태그 제거 후 순수 텍스트 모드로 무조건 발송
+                  print(f"[{idx+1}/{len(chunks)}] ⚠️ HTML 모드 실패 -> 일반 텍스트 재전송...")
                   plain_chunk = re.sub(r'<[^>]+>', '', chunk)
                   fallback_payload = {
                       "chat_id": chat_id,
