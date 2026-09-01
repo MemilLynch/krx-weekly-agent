@@ -2,7 +2,7 @@ name: Daily KRX Quant Agent
 
 on:
   schedule:
-    - cron: '10 7 * * 1-5' # KST 16:10
+    - cron: '10 7 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -37,7 +37,6 @@ jobs:
 
           if bot_token.lower().startswith("bot"): bot_token = bot_token[3:]
           
-          # URL 하이퍼링크 자동 변환(마크다운 깨짐) 방지를 위해 변수 분리
           HTTP = "https://"
           TG_DOMAIN = "api.telegram.org"
           GEMINI_DOMAIN = "generativelanguage.googleapis.com"
@@ -96,13 +95,13 @@ jobs:
                           price = int(re.sub(r'[^\d]', '', numeric_vals[0]))
                           rate_text = next((t for t in texts if '%' in t), "0.0%")
                           net_vol = int(re.sub(r'[^\d-]', '', numeric_vals[-2]))
-                          net_amt = int(re.sub(r'[^\d-]', '', numeric_vals[-1])) # 백만원 단위
+                          net_amt = int(re.sub(r'[^\d-]', '', numeric_vals[-1]))
 
                           if price < 100 or net_vol <= 0 or net_amt <= 0: continue
 
                           data_list.append({
                               "종목명": name, "종목코드": code, "현재가": price, "등락률": rate_text,
-                              "순매수량": net_vol, "순매수대금": net_amt * 1000000 # 원 단위 통일
+                              "순매수량": net_vol, "순매수대금": net_amt * 1000000
                           })
                       except: continue
                   return data_list
@@ -133,8 +132,6 @@ jobs:
 
               def process_top_stocks(df, top_n):
                   if df.empty: return []
-                  
-                  # 금액 기준 내림차순 정렬
                   top_df = df.sort_values(by='순매수대금', ascending=False).head(top_n).copy()
                   
                   results = []
@@ -203,15 +200,19 @@ jobs:
               payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
               report_text = ""
+              last_error = ""
               for attempt in range(1, 4):
                   res = requests.post(gemini_url, json=payload, timeout=60)
                   if res.status_code == 200:
                       report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
                       break
+                  else:
+                      last_error = f"HTTP {res.status_code}: {res.text}"
                   time.sleep(3)
 
               if not report_text: 
-                  raise Exception("Gemini API 응답 실패")
+                  # 에러 원인을 추적할 수 있도록 상세 내용 포함
+                  raise Exception(f"Gemini API 응답 실패. 구글 서버 메시지: {last_error}")
 
               report_text = report_text.replace("```html", "").replace("```", "").strip()
 
