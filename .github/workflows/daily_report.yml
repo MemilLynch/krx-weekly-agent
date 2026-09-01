@@ -153,39 +153,9 @@ jobs:
               samo_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(samo_list)]) if samo_list else "당일 사모펀드 매수 종목 없음"
 
               # -------------------------------------------------------------
-              # 3. Gemini 모델 자동 탐색(Auto-Discovery) 및 리포트 생성
+              # 3. Gemini 리포트 생성 (최신 요구 모델 적용)
               # -------------------------------------------------------------
-              print("3. 구글 API 서버에 사용 가능한 모델 확인 중...")
-              
-              model_list_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models?key={gemini_key}"
-              target_model = None
-              
-              try:
-                  m_res = requests.get(model_list_url, timeout=10)
-                  if m_res.status_code == 200:
-                      models_data = m_res.json().get("models", [])
-                      # 텍스트 생성(generateContent)이 가능한 gemini 모델만 추출
-                      valid_models = [m["name"] for m in models_data if "generateContent" in m.get("supportedGenerationMethods", []) and "gemini" in m["name"].lower()]
-                      
-                      # flash 모델을 최우선으로 선택 (가장 빠름)
-                      target_model = next((m for m in valid_models if "flash" in m.lower()), None)
-                      
-                      # flash가 없으면 사용 가능한 아무 모델이나 선택
-                      if not target_model and valid_models:
-                          target_model = valid_models[0]
-              except Exception as e:
-                  print(f"모델 탐색 중 경고 발생: {e}")
-              
-              # API 키 권한 문제 등으로 리스트를 못 가져왔을 때를 대비한 최후의 보루
-              if not target_model:
-                  target_model = "models/gemini-1.5-flash"
-                  
-              # 이미 'models/' 가 붙어있지 않다면 붙여주기
-              if not target_model.startswith("models/"):
-                  target_model = f"models/{target_model}"
-
-              print(f"✅ 최종 선택된 모델: {target_model}")
-
+              print("3. AI 분석 리포트 생성 중...")
               prompt = f"""
               오늘({today_print}) 국내 증시 수급 데이터다.
 
@@ -227,6 +197,9 @@ jobs:
               """
 
               payload = {"contents": [{"parts": [{"text": prompt}]}]}
+              
+              # 에러 로그에서 구글이 직접 지시한 최신 모델명으로 고정
+              target_model = "models/gemini-3.6-flash"
               gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/{target_model}:generateContent?key={gemini_key}"
 
               report_text = ""
