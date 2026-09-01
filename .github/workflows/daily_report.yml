@@ -2,7 +2,7 @@ name: Daily KRX Quant Agent
 
 on:
   schedule:
-    - cron: '10 7 * * 1-5'
+    - cron: '10 7 * * 1-5' # KST 16:10
   workflow_dispatch:
 
 jobs:
@@ -153,7 +153,7 @@ jobs:
               samo_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(samo_list)]) if samo_list else "당일 사모펀드 매수 종목 없음"
 
               # -------------------------------------------------------------
-              # 3. Gemini 프롬프트 및 리포트 생성
+              # 3. Gemini 프롬프트 및 자동 모델 매칭
               # -------------------------------------------------------------
               print("3. AI 분석 리포트 생성 중...")
               prompt = f"""
@@ -196,23 +196,35 @@ jobs:
               • (오늘 사모펀드 및 기관 수급의 전반적인 특징 1~2줄 요약)
               """
 
-              gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
               payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
+              
+              # 작동하는 모델을 스스로 찾을 때까지 순차적으로 테스트 (API 이름 변경 대응)
+              models_to_try = [
+                  "gemini-1.5-flash-latest",
+                  "gemini-2.0-flash",
+                  "gemini-1.5-flash-002",
+                  "gemini-1.0-pro-latest",
+                  "gemini-pro"
+              ]
+              
               report_text = ""
               last_error = ""
-              for attempt in range(1, 4):
+              
+              for model in models_to_try:
+                  gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/{model}:generateContent?key={gemini_key}"
+                  print(f"모델 테스트 중: {model}")
+                  
                   res = requests.post(gemini_url, json=payload, timeout=60)
                   if res.status_code == 200:
                       report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      print(f"✅ {model} 응답 성공")
                       break
                   else:
-                      last_error = f"HTTP {res.status_code}: {res.text}"
-                  time.sleep(3)
+                      last_error = f"[{model}] {res.status_code}: {res.text}"
+                  time.sleep(2)
 
               if not report_text: 
-                  # 에러 원인을 추적할 수 있도록 상세 내용 포함
-                  raise Exception(f"Gemini API 응답 실패. 구글 서버 메시지: {last_error}")
+                  raise Exception(f"모든 Gemini 모델 API 응답 실패. 마지막 에러: {last_error}")
 
               report_text = report_text.replace("```html", "").replace("```", "").strip()
 
