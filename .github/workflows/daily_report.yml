@@ -36,7 +36,13 @@ jobs:
           chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
 
           if bot_token.lower().startswith("bot"): bot_token = bot_token[3:]
-          tg_base_url = f"https://api.telegram.org/bot{bot_token}"
+          
+          # URL 하이퍼링크 자동 변환(마크다운 깨짐) 방지를 위해 변수 분리
+          HTTP = "https://"
+          TG_DOMAIN = "api.telegram.org"
+          GEMINI_DOMAIN = "generativelanguage.googleapis.com"
+          
+          tg_base_url = f"{HTTP}{TG_DOMAIN}/bot{bot_token}"
 
           def send_tg(text):
               try:
@@ -67,7 +73,7 @@ jobs:
               # 1. 네이버 수급 파싱 엔진 (1000: 기관, 1007: 사모펀드)
               # -------------------------------------------------------------
               def get_market_rank(mkt_gb, investor_gubun):
-                  url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
+                  url = f"{HTTP}finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
                   r = session.get(url, timeout=10)
                   soup = BeautifulSoup(r.content.decode("cp949", errors="ignore"), "html.parser")
 
@@ -113,7 +119,7 @@ jobs:
               # -------------------------------------------------------------
               def get_meta_data(code):
                   try:
-                      url = f"https://finance.naver.com/item/main.naver?code={code}"
+                      url = f"{HTTP}finance.naver.com/item/main.naver?code={code}"
                       r = session.get(url, timeout=5)
                       html = r.content.decode("cp949", errors="ignore")
                       
@@ -193,7 +199,7 @@ jobs:
               • (오늘 사모펀드 및 기관 수급의 전반적인 특징 1~2줄 요약)
               """
 
-              gemini_url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){gemini_key}"
+              gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
               payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
               report_text = ""
