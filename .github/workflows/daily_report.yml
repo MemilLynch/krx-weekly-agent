@@ -40,14 +40,12 @@ jobs:
 
           def send_tg(text):
               try:
-                  # 1차 시도: HTML 포맷
                   r = requests.post(tg_base_url + "/sendMessage", json={
                       "chat_id": chat_id, "text": text, "parse_mode": "HTML",
                       "disable_web_page_preview": True, "disable_notification": True
                   }, timeout=15)
                   if r.json().get("ok"): return True
                   
-                  # 2차 시도: 포맷 제거 후 플레인 텍스트 전송 (HTML 태그 에러 대비)
                   clean_text = text.replace("<b>", "").replace("</b>", "").replace("<", "").replace(">", "")
                   r2 = requests.post(tg_base_url + "/sendMessage", json={
                       "chat_id": chat_id, "text": f"⚠️ HTML 포맷 에러로 일반 텍스트 발송\n\n{clean_text}",
@@ -64,24 +62,31 @@ jobs:
 
           try:
               # -------------------------------------------------------------
-              # 1. 안전한 최근 영업일 탐색 (주말/공휴일/장마감전 방어)
+              # 1. 영업일 탐색 (while문으로 확실한 데이터 존재일 탐색)
               # -------------------------------------------------------------
               today_dt = datetime.datetime.today()
-              start_dt = today_dt - datetime.timedelta(days=10)
+              target_date = today_dt.strftime("%Y%m%d")
               
-              b_days = stock.get_business_days_dates(start_dt.strftime("%Y%m%d"), today_dt.strftime("%Y%m%d"))
-              target_date = b_days[-1].strftime("%Y%m%d") if len(b_days) > 0 else today_dt.strftime("%Y%m%d")
+              print(f"[{target_date}] 코스피 데이터 확인 중...")
+              ohlcv_test = stock.get_market_ohlcv(target_date, market="KOSPI")
+              
+              days_ago = 0
+              # 주말이거나 장 마감 전이라 데이터가 비어있으면 하루씩 뺌 (최대 10일)
+              while ohlcv_test.empty and days_ago < 10:
+                  days_ago += 1
+                  target_date = (today_dt - datetime.timedelta(days=days_ago)).strftime("%Y%m%d")
+                  ohlcv_test = stock.get_market_ohlcv(target_date, market="KOSPI")
+              
               target_print = target_date[:4] + "-" + target_date[4:6] + "-" + target_date[6:]
-              print(f"✅ 기준일자 설정 완료: {target_print}")
+              print(f"✅ 최종 기준일자 확정: {target_print}")
 
               # -------------------------------------------------------------
               # 2. 전체 시장 메타데이터 로드
               # -------------------------------------------------------------
-              print("데이터 로드 중...")
-              ohlcv = pd.concat([
-                  stock.get_market_ohlcv(target_date, market="KOSPI"),
-                  stock.get_market_ohlcv(target_date, market="KOSDAQ")
-              ])
+              print("메타데이터 및 수급 데이터 로드 중...")
+              ohlcv_kdq = stock.get_market_ohlcv(target_date, market="KOSDAQ")
+              ohlcv = pd.concat([ohlcv_test, ohlcv_kdq])
+              
               cap = pd.concat([
                   stock.get_market_cap(target_date, market="KOSPI"),
                   stock.get_market_cap(target_date, market="KOSDAQ")
@@ -100,7 +105,7 @@ jobs:
               df_samo = get_investor_data("사모펀드")
 
               # -------------------------------------------------------------
-              # 3. 데이터 정제 및 Top N 추출 (순매수 금액 기준)
+              # 3. 데이터 정제 및 Top N 추출
               # -------------------------------------------------------------
               pattern = "TIGER|KODEX|ACE|RISE|SOL|PLUS|KBSTAR|KOSEF|스팩|레버리지|인버스|ETN|선물"
 
@@ -111,7 +116,6 @@ jobs:
                   merged = df.join(meta_df, how='inner')
                   merged = merged[~merged['종목명'].str.contains(pattern, regex=True, na=False)]
                   
-                  # 금액 기준 내림차순 정렬
                   top_df = merged.sort_values(by='순매수거래대금', ascending=False).head(top_n).copy()
                   
                   results = []
@@ -190,14 +194,12 @@ jobs:
 
               report_text = report_text.replace("```html", "").replace("```", "").strip()
 
-              # 5. 전송
               if not send_tg(report_text):
                   raise Exception("텔레그램 전송 API에서 실패를 반환했습니다.")
               
               print("🎉 정상 실행 및 전송 완료")
 
           except Exception as e:
-              # 에러 발생 시 무조건 텔레그램으로 에러 내용 전송
               error_msg = f"⚠️ [에러 발생] 퀀트 봇 실행 중 문제가 발생했습니다.\n\n{traceback.format_exc()}"
               print(error_msg)
               send_tg(error_msg)
