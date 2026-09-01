@@ -153,9 +153,39 @@ jobs:
               samo_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(samo_list)]) if samo_list else "당일 사모펀드 매수 종목 없음"
 
               # -------------------------------------------------------------
-              # 3. Gemini 프롬프트 및 자동 모델 매칭
+              # 3. Gemini 모델 자동 탐색(Auto-Discovery) 및 리포트 생성
               # -------------------------------------------------------------
-              print("3. AI 분석 리포트 생성 중...")
+              print("3. 구글 API 서버에 사용 가능한 모델 확인 중...")
+              
+              model_list_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models?key={gemini_key}"
+              target_model = None
+              
+              try:
+                  m_res = requests.get(model_list_url, timeout=10)
+                  if m_res.status_code == 200:
+                      models_data = m_res.json().get("models", [])
+                      # 텍스트 생성(generateContent)이 가능한 gemini 모델만 추출
+                      valid_models = [m["name"] for m in models_data if "generateContent" in m.get("supportedGenerationMethods", []) and "gemini" in m["name"].lower()]
+                      
+                      # flash 모델을 최우선으로 선택 (가장 빠름)
+                      target_model = next((m for m in valid_models if "flash" in m.lower()), None)
+                      
+                      # flash가 없으면 사용 가능한 아무 모델이나 선택
+                      if not target_model and valid_models:
+                          target_model = valid_models[0]
+              except Exception as e:
+                  print(f"모델 탐색 중 경고 발생: {e}")
+              
+              # API 키 권한 문제 등으로 리스트를 못 가져왔을 때를 대비한 최후의 보루
+              if not target_model:
+                  target_model = "models/gemini-1.5-flash"
+                  
+              # 이미 'models/' 가 붙어있지 않다면 붙여주기
+              if not target_model.startswith("models/"):
+                  target_model = f"models/{target_model}"
+
+              print(f"✅ 최종 선택된 모델: {target_model}")
+
               prompt = f"""
               오늘({today_print}) 국내 증시 수급 데이터다.
 
@@ -197,34 +227,18 @@ jobs:
               """
 
               payload = {"contents": [{"parts": [{"text": prompt}]}]}
-              
-              # 작동하는 모델을 스스로 찾을 때까지 순차적으로 테스트 (API 이름 변경 대응)
-              models_to_try = [
-                  "gemini-1.5-flash-latest",
-                  "gemini-2.0-flash",
-                  "gemini-1.5-flash-002",
-                  "gemini-1.0-pro-latest",
-                  "gemini-pro"
-              ]
-              
+              gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/{target_model}:generateContent?key={gemini_key}"
+
               report_text = ""
-              last_error = ""
-              
-              for model in models_to_try:
-                  gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/{model}:generateContent?key={gemini_key}"
-                  print(f"모델 테스트 중: {model}")
-                  
+              for attempt in range(1, 4):
                   res = requests.post(gemini_url, json=payload, timeout=60)
                   if res.status_code == 200:
                       report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                      print(f"✅ {model} 응답 성공")
                       break
-                  else:
-                      last_error = f"[{model}] {res.status_code}: {res.text}"
-                  time.sleep(2)
+                  time.sleep(3)
 
               if not report_text: 
-                  raise Exception(f"모든 Gemini 모델 API 응답 실패. 마지막 에러: {last_error}")
+                  raise Exception(f"Gemini API 응답 실패. HTTP {res.status_code}: {res.text}")
 
               report_text = report_text.replace("```html", "").replace("```", "").strip()
 
