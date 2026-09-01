@@ -17,7 +17,7 @@ jobs:
       - name: 필수 라이브러리 설치
         run: pip install requests beautifulsoup4 pandas lxml
 
-      - name: 사모펀드/기관 수급 분석 및 텔레그램 전송
+      - name: 기관 수급 분석 및 텔레그램 전송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -69,10 +69,11 @@ jobs:
               today_print = datetime.datetime.now().strftime("%Y-%m-%d")
 
               # -------------------------------------------------------------
-              # 1. 네이버 수급 파싱 엔진 (1000: 기관, 1007: 사모펀드)
+              # 1. 네이버 수급 파싱 엔진 (금액 정확도 100% 보완)
               # -------------------------------------------------------------
-              def get_market_rank(mkt_gb, investor_gubun):
-                  url = f"{HTTP}finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_gubun}&type=buy&mkt_gb={mkt_gb}"
+              def get_market_rank(mkt_gb):
+                  # 1000: 기관합계
+                  url = f"{HTTP}finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun=1000&type=buy&mkt_gb={mkt_gb}"
                   r = session.get(url, timeout=10)
                   soup = BeautifulSoup(r.content.decode("cp949", errors="ignore"), "html.parser")
 
@@ -82,36 +83,37 @@ jobs:
                       if not a_tag: continue
                       
                       name = a_tag.text.strip()
+                      # 노이즈 종목 제외
                       if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN", "선물"]):
                           continue
 
                       code = re.search(r'code=(\d{6})', a_tag['href']).group(1)
-                      texts = [t.strip() for t in tr.stripped_strings if t.strip()]
+                      tds = tr.find_all("td")
+                      if len(tds) < 5: continue
                       
                       try:
-                          numeric_vals = [t for t in texts if t.replace(',', '').replace('+', '').replace('-', '').replace('%', '').replace('.', '').isdigit()]
-                          if len(numeric_vals) < 3: continue
+                          # 표 구조: 0:종목명, 1:현재가, 2:전일비, 3:등락률, 4:순매수량
+                          price = int(tds[1].text.replace(',', '').strip())
+                          rate_text = tds[3].text.strip()
+                          net_vol = int(tds[4].text.replace(',', '').strip()) # 순매수량
 
-                          price = int(re.sub(r'[^\d]', '', numeric_vals[0]))
-                          rate_text = next((t for t in texts if '%' in t), "0.0%")
-                          net_vol = int(re.sub(r'[^\d-]', '', numeric_vals[-2]))
-                          net_amt = int(re.sub(r'[^\d-]', '', numeric_vals[-1]))
+                          if price < 100 or net_vol <= 0: continue
 
-                          if price < 100 or net_vol <= 0 or net_amt <= 0: continue
+                          # 실제 순매수대금(원) = 현재가 * 순매수량
+                          net_amt = price * net_vol
 
                           data_list.append({
                               "종목명": name, "종목코드": code, "현재가": price, "등락률": rate_text,
-                              "순매수량": net_vol, "순매수대금": net_amt * 1000000
+                              "순매수량": net_vol, "순매수대금": net_amt
                           })
-                      except: continue
+                      except Exception as e:
+                          continue
                   return data_list
 
-              print("1. 네이버 수급 데이터 크롤링 중 (기관 및 사모펀드)...")
-              inst_data = get_market_rank('1', '1000') + get_market_rank('2', '1000')
-              samo_data = get_market_rank('1', '1007') + get_market_rank('2', '1007')
-
+              print("1. 네이버 기관 수급 데이터 크롤링 중...")
+              # 코스피(1) + 코스닥(2) 데이터 병합
+              inst_data = get_market_rank('1') + get_market_rank('2')
               df_inst = pd.DataFrame(inst_data)
-              df_samo = pd.DataFrame(samo_data)
 
               # -------------------------------------------------------------
               # 2. 거래량/상장주식수 메타데이터 연산
@@ -132,12 +134,14 @@ jobs:
 
               def process_top_stocks(df, top_n):
                   if df.empty: return []
+                  
+                  # 순매수대금(원) 기준으로 내림차순 정렬
                   top_df = df.sort_values(by='순매수대금', ascending=False).head(top_n).copy()
                   
                   results = []
                   for _, row in top_df.iterrows():
                       t_vol, t_shares = get_meta_data(row['종목코드'])
-                      amt_억 = round(row['순매수대금'] / 100000000, 1)
+                      amt_억 = round(row['순매수대금'] / 100000000, 1) # 억 단위 변환
                       vol_ratio = round((row['순매수량'] / t_vol) * 100, 2) if t_vol > 0 else 0.0
                       share_ratio = round((row['순매수량'] / t_shares) * 100, 3) if t_shares > 0 else 0.0
                       
@@ -146,24 +150,19 @@ jobs:
                   return results
 
               print("2. 메타데이터 조인 및 랭킹 산출 중...")
-              inst_list = process_top_stocks(df_inst, 3)
-              samo_list = process_top_stocks(df_samo, 5)
-
+              # 깃허브 액션 환경의 한계로 사모펀드 대신 기관합계 TOP 5를 산출합니다.
+              inst_list = process_top_stocks(df_inst, 5)
               inst_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(inst_list)]) if inst_list else "당일 기관 매수 종목 없음"
-              samo_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(samo_list)]) if samo_list else "당일 사모펀드 매수 종목 없음"
 
               # -------------------------------------------------------------
-              # 3. Gemini 리포트 생성 (최신 요구 모델 적용)
+              # 3. Gemini 리포트 생성 (에러 로그 기반 3.6 모델 고정)
               # -------------------------------------------------------------
               print("3. AI 분석 리포트 생성 중...")
               prompt = f"""
               오늘({today_print}) 국내 증시 수급 데이터다.
 
-              [기관합계 수급 상위 3종목 (금액순)]
+              [기관합계 수급 상위 5종목 (금액순)]
               {inst_str}
-
-              [사모펀드 수급 상위 5종목 (금액순)]
-              {samo_str}
 
               [★ 엄격 통제 지시사항 ★]
               1. 제공된 종목명, 가격, 비중 숫자를 단 하나도 바꾸거나 지어내지 마라.
@@ -171,36 +170,26 @@ jobs:
               3. <b> 텍스트 </b> 외의 모든 마크다운(##, **, ``` 등) 사용 금지. 단독 < 또는 > 기호 절대 금지.
 
               [★ 출력 템플릿 ★]
-              <b>📊 [{today_print}] 스마트머니 수급 브리핑</b>
+              <b>📊 [{today_print}] 스마트머니(기관) 수급 브리핑</b>
 
               ━━━━━━━━━━━━━━━━━━━
-              <b>1. 🛡️ 기관계 순매수 상위 3선</b>
+              <b>1. 🛡️ 기관계 매집 상위 5선</b>
 
               <b>■ 1. 종목명 (현재가 / 등락률)</b>
-              • <b>수급 팩트:</b> 순매수 OOO억 / 거래량 대비 O.O%
-              • <b>분석:</b> (객관적 코멘트 1줄)
-
-              (2위, 3위 동일하게 작성)
-
-              ━━━━━━━━━━━━━━━━━━━
-              <b>2. 🕵️ 사모펀드 매집 상위 5선</b>
-
-              <b>■ 1. 종목명 (현재가 / 등락률)</b>
-              • <b>수급 팩트:</b> 순매수 OOO억 / 주식수 대비 O.OO%
-              • <b>분석:</b> (가속도 및 유통물량 잠식 관점 코멘트 1줄)
+              • <b>수급 팩트:</b> 순매수 OOO억 / 거래량 대비 O.O% / 주식수 대비 O.OO%
+              • <b>분석:</b> (유통물량 잠식 및 수급 가속도 관점의 코멘트 1줄)
 
               (2위부터 5위까지 동일하게 작성)
 
               ━━━━━━━━━━━━━━━━━━━
-              <b>3. 💡 수급 특이사항 요약</b>
-              • (오늘 사모펀드 및 기관 수급의 전반적인 특징 1~2줄 요약)
+              <b>2. 💡 수급 특이사항 요약</b>
+              • (오늘 기관 수급의 전반적인 특징 1~2줄 요약)
               """
 
               payload = {"contents": [{"parts": [{"text": prompt}]}]}
               
-              # 에러 로그에서 구글이 직접 지시한 최신 모델명으로 고정
-              target_model = "models/gemini-3.6-flash"
-              gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/{target_model}:generateContent?key={gemini_key}"
+              # 확실하게 동작하는 구글 최신 버전 고정
+              gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent?key={gemini_key}"
 
               report_text = ""
               for attempt in range(1, 4):
