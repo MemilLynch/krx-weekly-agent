@@ -2,8 +2,7 @@ name: Daily KRX Quant Agent
 
 on:
   schedule:
-    # 한국 시간(KST) 평일 16:10 자동 실행 (UTC 07:10)
-    - cron: '10 7 * * 1-5'
+    - cron: '10 7 * * 1-5' # KST 16:10
   workflow_dispatch:
 
 jobs:
@@ -15,203 +14,194 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 1. 라이브러리에 pykrx 추가 (bs4, lxml 제거)
       - name: 필수 라이브러리 설치
         run: pip install requests pandas pykrx
 
-      - name: 메이저 수급 실데이터 분석 및 텔레그램 무음 발송
+      - name: 사모펀드/기관 수급 분석 및 텔레그램 전송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat << 'EOF' > run_agent.py
-          import os, sys, time, datetime, re, requests
+          import os, sys, time, datetime, re, requests, traceback
           import pandas as pd
           from pykrx import stock
 
           # -------------------------------------------------------------
-          # 0. 환경변수 검증
+          # 0. 환경변수 및 텔레그램 함수 설정
           # -------------------------------------------------------------
           gemini_key = os.getenv("GEMINI_API_KEY", "").strip('\'"')
           bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('\'"')
           chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
 
           if bot_token.lower().startswith("bot"): bot_token = bot_token[3:]
+          tg_base_url = f"https://api.telegram.org/bot{bot_token}"
+
+          def send_tg(text):
+              try:
+                  # 1차 시도: HTML 포맷
+                  r = requests.post(tg_base_url + "/sendMessage", json={
+                      "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": True, "disable_notification": True
+                  }, timeout=15)
+                  if r.json().get("ok"): return True
+                  
+                  # 2차 시도: 포맷 제거 후 플레인 텍스트 전송 (HTML 태그 에러 대비)
+                  clean_text = text.replace("<b>", "").replace("</b>", "").replace("<", "").replace(">", "")
+                  r2 = requests.post(tg_base_url + "/sendMessage", json={
+                      "chat_id": chat_id, "text": f"⚠️ HTML 포맷 에러로 일반 텍스트 발송\n\n{clean_text}",
+                      "disable_web_page_preview": True, "disable_notification": True
+                  }, timeout=15)
+                  return r2.json().get("ok")
+              except Exception as e:
+                  print("Telegram 전송 실패:", e)
+                  return False
 
           if not gemini_key or not bot_token or not chat_id:
               print("❌ 환경변수 누락")
               sys.exit(1)
 
-          HTTP = "https://"
-          GEMINI_DOMAIN = "generativelanguage.googleapis.com"
-          tg_base_url = f"{HTTP}api.telegram.org/bot{bot_token}"
-
-          today_dt = datetime.datetime.today()
-          today_str = today_dt.strftime("%Y%m%d")
-          today_print = today_dt.strftime("%Y-%m-%d")
-
-          # -------------------------------------------------------------
-          # 1. 전체 시장 메타데이터 로드 (pykrx)
-          # -------------------------------------------------------------
-          print("1. 전체 시장 데이터(가격/거래량/상장주식수) 로드 중...")
-          # 코스피/코스닥 종가, 거래량 등
-          ohlcv_kpi = stock.get_market_ohlcv(today_str, market="KOSPI")
-          ohlcv_kdq = stock.get_market_ohlcv(today_str, market="KOSDAQ")
-          ohlcv = pd.concat([ohlcv_kpi, ohlcv_kdq])
-
-          # 코스피/코스닥 상장주식수
-          cap_kpi = stock.get_market_cap(today_str, market="KOSPI")
-          cap_kdq = stock.get_market_cap(today_str, market="KOSDAQ")
-          cap = pd.concat([cap_kpi, cap_kdq])
-
-          # 메타데이터 병합
-          meta_df = pd.merge(ohlcv, cap[['상장주식수']], left_index=True, right_index=True)
-
-          # -------------------------------------------------------------
-          # 2. 투자자별 수급 데이터 로드 (pykrx)
-          # -------------------------------------------------------------
-          print("2. 투자자별 수급 데이터 로드 중...")
-          def get_investor_data(investor_name):
-              df_kpi = stock.get_market_net_purchases_of_equities_by_ticker(today_str, today_str, "KOSPI", investor_name)
-              df_kdq = stock.get_market_net_purchases_of_equities_by_ticker(today_str, today_str, "KOSDAQ", investor_name)
-              df = pd.concat([df_kpi, df_kdq])
-              return df
-
-          df_frgn = get_investor_data("외국인")
-          df_inst = get_investor_data("기관합계")
-          df_samo = get_investor_data("사모펀드") # 필요시 프롬프트에 추가하여 활용 가능
-
-          # -------------------------------------------------------------
-          # 3. 데이터 정제 및 비중 연산
-          # -------------------------------------------------------------
-          pattern = "TIGER|KODEX|ACE|RISE|SOL|PLUS|KBSTAR|KOSEF|스팩|레버리지|인버스|ETN|선물"
-
-          def process_top_stocks(df_net_purchase):
-              if df_net_purchase.empty: return pd.DataFrame()
+          try:
+              # -------------------------------------------------------------
+              # 1. 안전한 최근 영업일 탐색 (주말/공휴일/장마감전 방어)
+              # -------------------------------------------------------------
+              today_dt = datetime.datetime.today()
+              start_dt = today_dt - datetime.timedelta(days=10)
               
-              # 순매수대금 0 초과인 종목만 타겟
-              df_net_purchase = df_net_purchase[df_net_purchase['순매수거래대금'] > 0]
-              
-              # 가격, 거래량 등 메타데이터와 조인
-              merged = df_net_purchase.join(meta_df, how='inner')
-              
-              # ETF 및 노이즈 종목 제외
-              merged = merged[~merged['종목명'].str.contains(pattern, regex=True)]
-              
-              # 거래대금 상위 정렬
-              top_df = merged.sort_values(by='순매수거래대금', ascending=False).head(10).copy()
-              
-              results = []
-              for ticker, row in top_df.iterrows():
-                  amt_억 = round(row['순매수거래대금'] / 100000000, 1) # pykrx 원 단위를 억 단위로 변환
-                  vol_ratio = round((row['순매수거래량'] / row['거래량']) * 100, 2) if row['거래량'] > 0 else 0.0
-                  share_ratio = round((row['순매수거래량'] / row['상장주식수']) * 100, 3) if row['상장주식수'] > 0 else 0.0
+              b_days = stock.get_business_days_dates(start_dt.strftime("%Y%m%d"), today_dt.strftime("%Y%m%d"))
+              target_date = b_days[-1].strftime("%Y%m%d") if len(b_days) > 0 else today_dt.strftime("%Y%m%d")
+              target_print = target_date[:4] + "-" + target_date[4:6] + "-" + target_date[6:]
+              print(f"✅ 기준일자 설정 완료: {target_print}")
+
+              # -------------------------------------------------------------
+              # 2. 전체 시장 메타데이터 로드
+              # -------------------------------------------------------------
+              print("데이터 로드 중...")
+              ohlcv = pd.concat([
+                  stock.get_market_ohlcv(target_date, market="KOSPI"),
+                  stock.get_market_ohlcv(target_date, market="KOSDAQ")
+              ])
+              cap = pd.concat([
+                  stock.get_market_cap(target_date, market="KOSPI"),
+                  stock.get_market_cap(target_date, market="KOSDAQ")
+              ])
+              meta_df = pd.merge(ohlcv, cap[['상장주식수']], left_index=True, right_index=True)
+
+              def get_investor_data(inv_name):
+                  try:
+                      kpi = stock.get_market_net_purchases_of_equities_by_ticker(target_date, target_date, "KOSPI", inv_name)
+                      kdq = stock.get_market_net_purchases_of_equities_by_ticker(target_date, target_date, "KOSDAQ", inv_name)
+                      return pd.concat([kpi, kdq])
+                  except:
+                      return pd.DataFrame()
+
+              df_inst = get_investor_data("기관합계")
+              df_samo = get_investor_data("사모펀드")
+
+              # -------------------------------------------------------------
+              # 3. 데이터 정제 및 Top N 추출 (순매수 금액 기준)
+              # -------------------------------------------------------------
+              pattern = "TIGER|KODEX|ACE|RISE|SOL|PLUS|KBSTAR|KOSEF|스팩|레버리지|인버스|ETN|선물"
+
+              def process_top_stocks(df, top_n):
+                  if df.empty: return []
                   
-                  results.append({
-                      "종목명": row['종목명'], "종목코드": ticker, 
-                      "현재가": row['종가'], "등락률": row['등락률'],
-                      "순매수대금_억": amt_억, "순매수량": row['순매수거래량'], "거래량비중": vol_ratio,
-                      "포맷_텍스트": f"{row['종목명']} ({row['종가']:,}원 / {row['등락률']}%) | 순매수 {amt_억:,}억 | 거래량대비 {vol_ratio}% | 상장주식수대비 {share_ratio}%"
-                  })
-              
-              res_df = pd.DataFrame(results)
-              if not res_df.empty:
-                  # 거래량 비중이 높은 순으로 최종 3개 추출 (기존 로직 유지)
-                  return res_df.sort_values(by='거래량비중', ascending=False).head(3).reset_index(drop=True)
-              return pd.DataFrame()
-
-          print("3. 수급 비중 및 쌍끌이 연산 수행 중...")
-          df_frgn_top = process_top_stocks(df_frgn)
-          df_inst_top = process_top_stocks(df_inst)
-          
-          # 쌍끌이 로직
-          df_dual = pd.DataFrame()
-          if not df_frgn.empty and not df_inst.empty:
-              # 외국인과 기관 조인
-              merged_dual = df_frgn.join(df_inst, lsuffix='_f', rsuffix='_i', how='inner')
-              # 양쪽 모두 순매수한 종목 필터링
-              merged_dual = merged_dual[(merged_dual['순매수거래대금_f'] > 0) & (merged_dual['순매수거래대금_i'] > 0)]
-              
-              if not merged_dual.empty:
-                  merged_dual['합산대금'] = merged_dual['순매수거래대금_f'] + merged_dual['순매수거래대금_i']
-                  merged_dual['합산수량'] = merged_dual['순매수거래량_f'] + merged_dual['순매수거래량_i']
+                  df = df[df['순매수거래대금'] > 0]
+                  merged = df.join(meta_df, how='inner')
+                  merged = merged[~merged['종목명'].str.contains(pattern, regex=True, na=False)]
                   
-                  merged_dual = merged_dual.join(meta_df, how='inner')
-                  merged_dual = merged_dual[~merged_dual['종목명_f'].str.contains(pattern, regex=True)]
+                  # 금액 기준 내림차순 정렬
+                  top_df = merged.sort_values(by='순매수거래대금', ascending=False).head(top_n).copy()
                   
-                  top_dual = merged_dual.sort_values(by='합산대금', ascending=False).head(2)
-                  dual_res = []
-                  for ticker, row in top_dual.iterrows():
-                      amt_억 = round(row['합산대금'] / 100000000, 1)
-                      vol_ratio = round((row['합산수량'] / row['거래량']) * 100, 2) if row['거래량'] > 0 else 0.0
+                  results = []
+                  for ticker, row in top_df.iterrows():
+                      amt_억 = round(row['순매수거래대금'] / 100000000, 1)
+                      vol_ratio = round((row['순매수거래량'] / row['거래량']) * 100, 2) if row.get('거래량', 0) > 0 else 0.0
+                      share_ratio = round((row['순매수거래량'] / row['상장주식수']) * 100, 3) if row.get('상장주식수', 0) > 0 else 0.0
                       
-                      dual_res.append({
-                          "쌍끌이_텍스트": f"{row['종목명_f']} ({row['종가']:,}원 / {row['등락률']}%) | 합산 {amt_억:,}억 | 거래량대비 {vol_ratio}%"
-                      })
-                  df_dual = pd.DataFrame(dual_res)
+                      txt = f"{row['종목명']} ({row['종가']:,}원 / {row['등락률']}%) | 순매수 {amt_억:,}억 | 거래량대비 {vol_ratio}% | 주식수대비 {share_ratio}%"
+                      results.append(txt)
+                  return results
 
-          # -------------------------------------------------------------
-          # 4. Gemini 프롬프트 및 리포트 생성
-          # -------------------------------------------------------------
-          frgn_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_frgn_top.iterrows()]) if not df_frgn_top.empty else "당일 집계 종목 없음"
-          inst_str = "\n".join([f"{i+1}. {r['포맷_텍스트']}" for i, r in df_inst_top.iterrows()]) if not df_inst_top.empty else "당일 집계 종목 없음"
-          dual_str = "\n".join([f"{i+1}. {r['쌍끌이_텍스트']}" for i, r in df_dual.iterrows()]) if not df_dual.empty else "당일 동시 매집 종목 없음"
+              inst_list = process_top_stocks(df_inst, 3)
+              samo_list = process_top_stocks(df_samo, 5)
 
-          prompt = f"""
-          오늘({today_print}) 국내 증시 기관/외국인 수급 팩트 데이터다.
+              inst_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(inst_list)]) if inst_list else "당일 기관 매수 종목 없음"
+              samo_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(samo_list)]) if samo_list else "당일 사모펀드 매수 종목 없음"
 
-          [외국인 수급 상위 3종목]
-          {frgn_str}
+              # -------------------------------------------------------------
+              # 4. Gemini 프롬프트 및 리포트 생성
+              # -------------------------------------------------------------
+              prompt = f"""
+              오늘({target_print}) 국내 증시 수급 데이터다.
 
-          [기관 수급 상위 3종목]
-          {inst_str}
+              [기관합계 수급 상위 3종목 (금액순)]
+              {inst_str}
 
-          [외인·기관 동시 순매수]
-          {dual_str}
+              [사모펀드 수급 상위 5종목 (금액순)]
+              {samo_str}
 
-          [★ 엄격 통제 지시사항 ★]
-          1. 위에서 제공된 종목명, 가격, 비중 숫자를 단 하나도 바꾸거나 지어내지 말고 100% 똑같이 복사해서 써라.
-          2. 데이터가 없으면 억지로 분석하지 말고 '당일 집계 종목 없음'이라고 명시해라.
-          3. 증권사 리서치 데스크의 드라이(Dry)한 어조로 팩트만 서술해라.
-          4. 각 섹션(■ 1., ■ 2.) 사이사이에 반드시 '빈 줄(줄바꿈 2번)'을 넣어라.
-          5. 마크다운 표, <code>, ``` 금지. 제목 및 강조는 <b>텍스트</b> 태그만 써라.
-          6. 단독 < 또는 > 기호 절대 금지.
+              [★ 엄격 통제 지시사항 ★]
+              1. 위에서 제공된 종목명, 가격, 비중 숫자를 단 하나도 바꾸거나 지어내지 말고 100% 똑같이 복사해서 써라.
+              2. 데이터가 없으면 '종목 없음'이라고 명시해라.
+              3. 증권사 퀀트 데스크의 드라이(Dry)한 어조로 객관적 팩트만 서술해라.
+              4. <b> 텍스트 </b> 외의 모든 마크다운(##, **, ``` 등) 사용 금지. 단독 < 또는 > 기호 절대 금지.
 
-          [★ 출력 템플릿 ★]
-          <b>📊 [{today_print}] 외국인·기관 수급 분석 브리핑</b>
+              [★ 출력 템플릿 ★]
+              <b>📊 [{target_print}] 스마트머니 수급 브리핑</b>
 
-          ━━━━━━━━━━━━━━━━━━━
-          <b>1. 📌 당일 시장 수급 동향</b>
-          • (수급 집중도에 대한 1~2줄 요약)
+              ━━━━━━━━━━━━━━━━━━━
+              <b>1. 🛡️ 기관계 순매수 상위 3선</b>
 
-          ━━━━━━━━━━━━━━━━━━━
-          <b>2. 🎯 외국인 순매수 비중 상위</b>
-          (※ 데이터 없으면 '당일 집계 종목 없음' 한 줄만 출력)
+              <b>■ 1. 종목명 (현재가 / 등락률)</b>
+              • <b>수급 팩트:</b> 순매수 OOO억 / 거래량 대비 O.O%
+              • <b>분석:</b> (객관적 코멘트 1줄)
 
-          <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 지표:</b> 순매수 OOO억 / 거래량 대비 O.O% / 상장주식수 대비 O.OO%
-          • <b>거래 분석:</b> (객관적 팩트 1줄)
+              (2위, 3위 동일하게 작성)
 
-          <b>■ 3. 🛡️ 기관 순매수 비중 상위</b>
-          (위와 동일 템플릿으로 작성)
+              ━━━━━━━━━━━━━━━━━━━
+              <b>2. 🕵️ 사모펀드 매집 상위 5선</b>
 
-          ━━━━━━━━━━━━━━━━━━━
-          <b>4. 🔥 외인·기관 동시 순매수 (쌍끌이)</b>
-          (※ 데이터 없으면 '당일 동시 매집 종목 없음' 한 줄만 출력)
+              <b>■ 1. 종목명 (현재가 / 등락률)</b>
+              • <b>수급 팩트:</b> 순매수 OOO억 / 주식수 대비 O.OO%
+              • <b>분석:</b> (가속도 및 유통물량 잠식 관점 코멘트 1줄)
 
-          <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>합산 수급:</b> 합산 OOO억 / 거래량 대비 O.O%
-          • <b>수급 팩트:</b> (객관적 팩트 1줄)
+              (2위부터 5위까지 동일하게 작성)
 
-          ━━━━━━━━━━━━━━━━━━━
-          <b>5. 💡 수급 특이사항 요약</b>
-          • (오늘 장 수급 특징 사실 기반 1~2줄 요약)
-          """
+              ━━━━━━━━━━━━━━━━━━━
+              <b>3. 💡 수급 특이사항 요약</b>
+              • (오늘 사모펀드 및 기관 수급의 전반적인 방향성 1~2줄 요약)
+              """
 
-          # ✨ 에러의 원인이었던 모델명을 올바른 최신 모델(gemini-1.5-flash)로 변경 ✨
-          gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
-          payload = {"contents": [{"parts": [{"text": prompt}]}]}
+              gemini_url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){gemini_key}"
+              payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
-          report_text = ""
-          for attempt in range(1, 4):
+              report_text = ""
+              for attempt in range(1, 4):
+                  res = requests.post(gemini_url, json=payload, timeout=60)
+                  if res.status_code == 200:
+                      report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                      break
+                  time.sleep(3)
+
+              if not report_text: 
+                  raise Exception(f"Gemini 응답 실패. 상태코드: {res.status_code}, 메시지: {res.text}")
+
+              report_text = report_text.replace("```html", "").replace("```", "").strip()
+
+              # 5. 전송
+              if not send_tg(report_text):
+                  raise Exception("텔레그램 전송 API에서 실패를 반환했습니다.")
+              
+              print("🎉 정상 실행 및 전송 완료")
+
+          except Exception as e:
+              # 에러 발생 시 무조건 텔레그램으로 에러 내용 전송
+              error_msg = f"⚠️ [에러 발생] 퀀트 봇 실행 중 문제가 발생했습니다.\n\n{traceback.format_exc()}"
+              print(error_msg)
+              send_tg(error_msg)
+              sys.exit(1)
+          EOF
+
+          python run_agent.py
