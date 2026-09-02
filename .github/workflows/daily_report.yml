@@ -24,197 +24,290 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat << 'EOF' > run_agent.py
-          import os, sys, time, datetime, re, requests, traceback
+          import os
+          import sys
+          import time
+          import datetime
+          import re
+          import logging
+          import traceback
+          import random
+          import requests
           import pandas as pd
           from bs4 import BeautifulSoup
 
-          # -------------------------------------------------------------
-          # 0. 환경변수 및 텔레그램 설정
-          # -------------------------------------------------------------
-          gemini_key = os.getenv("GEMINI_API_KEY", "").strip('\'"')
-          bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('\'"')
-          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
+          # ==============================================================================
+          # 0. 로깅 및 환경 설정
+          # ==============================================================================
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s [%(levelname)s] %(message)s',
+              datefmt='%Y-%m-%d %H:%M:%S'
+          )
+          logger = logging.getLogger("QuantAgent")
 
-          if bot_token.lower().startswith("bot"): bot_token = bot_token[3:]
-          
-          HTTP = "https://"
-          TG_DOMAIN = "api.telegram.org"
-          GEMINI_DOMAIN = "generativelanguage.googleapis.com"
-          
-          tg_base_url = f"{HTTP}{TG_DOMAIN}/bot{bot_token}"
-
-          def send_tg(text):
-              try:
-                  r = requests.post(tg_base_url + "/sendMessage", json={
-                      "chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                      "disable_web_page_preview": True, "disable_notification": True
-                  }, timeout=15)
-                  if r.json().get("ok"): return True
+          class Config:
+              GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip('\'"')
+              TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('\'"')
+              TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
+              
+              if TG_TOKEN.lower().startswith("bot"): 
+                  TG_TOKEN = TG_TOKEN[3:]
                   
-                  clean_text = text.replace("<b>", "").replace("</b>", "").replace("<", "").replace(">", "")
-                  r2 = requests.post(tg_base_url + "/sendMessage", json={
-                      "chat_id": chat_id, "text": f"⚠️ HTML 포맷 에러로 일반 텍스트 발송\n\n{clean_text}",
-                      "disable_web_page_preview": True, "disable_notification": True
-                  }, timeout=15)
-                  return r2.json().get("ok")
-              except: return False
+              HTTP = "https://"
+              TG_API = f"{HTTP}api.telegram.org/bot{TG_TOKEN}"
+              GEMINI_API = f"{HTTP}generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_KEY}"
+              
+              USER_AGENTS = [
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+                  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+              ]
+              NOISE_KEYWORDS = ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN", "선물", "차이나", "베트남", "미국"]
 
-          if not gemini_key or not bot_token or not chat_id:
-              print("❌ 환경변수 누락")
-              sys.exit(1)
+          # ==============================================================================
+          # 1. 텔레그램 알림 시스템
+          # ==============================================================================
+          class TelegramNotifier:
+              def __init__(self):
+                  self.url = Config.TG_API
+                  self.chat_id = Config.TG_CHAT_ID
 
-          try:
-              session = requests.Session()
-              session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-              today_print = datetime.datetime.now().strftime("%Y-%m-%d")
+              def send(self, text, parse_mode="HTML"):
+                  payload = {
+                      "chat_id": self.chat_id,
+                      "text": text,
+                      "parse_mode": parse_mode,
+                      "disable_web_page_preview": True,
+                      "disable_notification": True
+                  }
+                  for attempt in range(3):
+                      try:
+                          r = requests.post(f"{self.url}/sendMessage", json=payload, timeout=15)
+                          if r.status_code == 200 and r.json().get("ok"):
+                              return True
+                      except Exception as e:
+                          time.sleep(2)
+                  return False
 
-              # -------------------------------------------------------------
-              # 1. 네이버 수급 파싱 엔진 (금액 정확도 100% 보완)
-              # -------------------------------------------------------------
-              def get_market_rank(mkt_gb):
-                  # 1000: 기관합계
-                  url = f"{HTTP}finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun=1000&type=buy&mkt_gb={mkt_gb}"
-                  r = session.get(url, timeout=10)
-                  soup = BeautifulSoup(r.content.decode("cp949", errors="ignore"), "html.parser")
+              def send_safe(self, text):
+                  if not self.send(text, parse_mode="HTML"):
+                      clean_text = text.replace("<b>", "").replace("</b>", "").replace("<", "").replace(">", "")
+                      clean_text = f"⚠️ [포맷 경고] 일반 텍스트 모드\n\n{clean_text}"
+                      return self.send(clean_text, parse_mode="")
+                  return True
+
+          # ==============================================================================
+          # 2. 네이버 금융 크롤러 (★ 금액 계산 오류 완벽 수정 ★)
+          # ==============================================================================
+          class MarketScraper:
+              def __init__(self):
+                  self.session = requests.Session()
+
+              def _get_html(self, url, retries=3):
+                  for i in range(retries):
+                      try:
+                          self.session.headers.update({"User-Agent": random.choice(Config.USER_AGENTS)})
+                          res = self.session.get(url, timeout=10)
+                          res.raise_for_status()
+                          return BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
+                      except Exception as e:
+                          time.sleep(2 ** i)
+                  return None
+
+              def fetch_institution_rank(self, market_code):
+                  url = f"{Config.HTTP}finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun=1000&type=buy&mkt_gb={market_code}"
+                  soup = self._get_html(url)
+                  if not soup: return []
 
                   data_list = []
                   for tr in soup.find_all("tr"):
-                      a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
-                      if not a_tag: continue
-                      
-                      name = a_tag.text.strip()
-                      # 노이즈 종목 제외
-                      if any(k in name for k in ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN", "선물"]):
-                          continue
-
-                      code = re.search(r'code=(\d{6})', a_tag['href']).group(1)
-                      tds = tr.find_all("td")
-                      if len(tds) < 5: continue
-                      
-                      try:
-                          # 표 구조: 0:종목명, 1:현재가, 2:전일비, 3:등락률, 4:순매수량
-                          price = int(tds[1].text.replace(',', '').strip())
-                          rate_text = tds[3].text.strip()
-                          net_vol = int(tds[4].text.replace(',', '').strip()) # 순매수량
-
-                          if price < 100 or net_vol <= 0: continue
-
-                          # 실제 순매수대금(원) = 현재가 * 순매수량
-                          net_amt = price * net_vol
-
-                          data_list.append({
-                              "종목명": name, "종목코드": code, "현재가": price, "등락률": rate_text,
-                              "순매수량": net_vol, "순매수대금": net_amt
-                          })
-                      except Exception as e:
-                          continue
+                      data = self._parse_rank_row(tr)
+                      if data: data_list.append(data)
                   return data_list
 
-              print("1. 네이버 기관 수급 데이터 크롤링 중...")
-              # 코스피(1) + 코스닥(2) 데이터 병합
-              inst_data = get_market_rank('1') + get_market_rank('2')
-              df_inst = pd.DataFrame(inst_data)
+              def _parse_rank_row(self, tr):
+                  a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
+                  if not a_tag: return None
+                  
+                  name = a_tag.text.strip()
+                  if any(k in name for k in Config.NOISE_KEYWORDS): return None
 
-              # -------------------------------------------------------------
-              # 2. 거래량/상장주식수 메타데이터 연산
-              # -------------------------------------------------------------
-              def get_meta_data(code):
+                  code_match = re.search(r'code=(\d{6})', a_tag['href'])
+                  if not code_match: return None
+                  code = code_match.group(1)
+
+                  # 텍스트 덩어리가 아닌, 실제 테이블의 칸(td)을 명확하게 지정합니다.
+                  tds = tr.find_all("td")
+                  if len(tds) < 6: return None
+
                   try:
-                      url = f"{HTTP}finance.naver.com/item/main.naver?code={code}"
-                      r = session.get(url, timeout=5)
-                      html = r.content.decode("cp949", errors="ignore")
+                      # tds[2]: 현재가, tds[4]: 등락률, tds[5]: 순매수량
+                      price_str = tds[2].text.replace(',', '').strip()
+                      price = int(re.sub(r'[^\d]', '', price_str))
                       
-                      vol_match = re.search(r'id="_quant"[^>]*>([\d,]+)', html)
+                      rate_text = tds[4].text.strip()
+                      
+                      vol_str = tds[5].text.replace(',', '').strip()
+                      net_vol = int(re.sub(r'[^\d-]', '', vol_str))
+
+                      # 잡주 필터링 (동전주 제외)
+                      if price < 100 or net_vol <= 0: return None
+
+                      # 정확한 순매수대금(원) 연산
+                      net_amt = price * net_vol
+                      
+                      return {
+                          "종목명": name, "종목코드": code, "현재가": price, "등락률": rate_text,
+                          "순매수량": net_vol, "순매수대금": net_amt
+                      }
+                  except Exception as e:
+                      return None
+
+              def fetch_metadata(self, code):
+                  url = f"{Config.HTTP}finance.naver.com/item/main.naver?code={code}"
+                  soup = self._get_html(url)
+                  if not soup: return 0, 0
+                  
+                  try:
+                      html_str = str(soup)
+                      vol_match = re.search(r'id="_quant"[^>]*>([\d,]+)', html_str)
                       vol = int(vol_match.group(1).replace(',', '')) if vol_match else 0
                       
-                      share_match = re.search(r'상장주식수.*?([\d,]+)', html, re.DOTALL)
+                      share_match = re.search(r'상장주식수.*?([\d,]+)', html_str, re.DOTALL)
                       shares = int(share_match.group(1).replace(',', '')) if share_match else 0
                       return vol, shares
-                  except: return 0, 0
+                  except:
+                      return 0, 0
 
-              def process_top_stocks(df, top_n):
-                  if df.empty: return []
+          # ==============================================================================
+          # 3. 데이터 분석 및 랭킹 산출 엔진 (★ 비중 연산 검증 완료 ★)
+          # ==============================================================================
+          class QuantAnalyzer:
+              def __init__(self, scraper: MarketScraper):
+                  self.scraper = scraper
+
+              def process_top_stocks(self, raw_data, top_n=5):
+                  df = pd.DataFrame(raw_data)
+                  if df.empty: 
+                      logger.warning("파싱된 유효 데이터가 없습니다.")
+                      return []
                   
-                  # 순매수대금(원) 기준으로 내림차순 정렬
+                  # 정확히 계산된 '순매수대금(원)' 기준으로 정렬
                   top_df = df.sort_values(by='순매수대금', ascending=False).head(top_n).copy()
                   
                   results = []
                   for _, row in top_df.iterrows():
-                      t_vol, t_shares = get_meta_data(row['종목코드'])
-                      amt_억 = round(row['순매수대금'] / 100000000, 1) # 억 단위 변환
+                      t_vol, t_shares = self.scraper.fetch_metadata(row['종목코드'])
+                      
+                      # 1억 단위로 깔끔하게 떨어지게 소수점 첫째자리 반올림
+                      amt_억 = round(row['순매수대금'] / 100000000, 1)
                       vol_ratio = round((row['순매수량'] / t_vol) * 100, 2) if t_vol > 0 else 0.0
                       share_ratio = round((row['순매수량'] / t_shares) * 100, 3) if t_shares > 0 else 0.0
                       
                       txt = f"{row['종목명']} ({row['현재가']:,}원 / {row['등락률']}) | 순매수 {amt_억:,}억 | 거래량대비 {vol_ratio}% | 주식수대비 {share_ratio}%"
                       results.append(txt)
+                      logger.info(f"산출 완료: {row['종목명']} - {amt_억}억")
+                      
                   return results
 
-              print("2. 메타데이터 조인 및 랭킹 산출 중...")
-              # 깃허브 액션 환경의 한계로 사모펀드 대신 기관합계 TOP 5를 산출합니다.
-              inst_list = process_top_stocks(df_inst, 5)
-              inst_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(inst_list)]) if inst_list else "당일 기관 매수 종목 없음"
+          # ==============================================================================
+          # 4. Gemini AI 리포트 생성기
+          # ==============================================================================
+          class ReportGenerator:
+              def __init__(self, api_url):
+                  self.api_url = api_url
 
-              # -------------------------------------------------------------
-              # 3. Gemini 리포트 생성 (에러 로그 기반 3.6 모델 고정)
-              # -------------------------------------------------------------
-              print("3. AI 분석 리포트 생성 중...")
-              prompt = f"""
-              오늘({today_print}) 국내 증시 수급 데이터다.
+              def generate(self, inst_list, today_str):
+                  inst_str = "\n".join([f"{i+1}. {txt}" for i, txt in enumerate(inst_list)]) if inst_list else "당일 기관 매수 종목 없음"
+                  
+                  prompt = f"""
+                  오늘({today_str}) 국내 증시 수급 데이터다.
 
-              [기관합계 수급 상위 5종목 (금액순)]
-              {inst_str}
+                  [기관합계 수급 상위 5종목 (금액순)]
+                  {inst_str}
 
-              [★ 엄격 통제 지시사항 ★]
-              1. 제공된 종목명, 가격, 비중 숫자를 단 하나도 바꾸거나 지어내지 마라.
-              2. 증권사 퀀트 데스크의 드라이(Dry)한 어조로 객관적 팩트만 서술해라.
-              3. <b> 텍스트 </b> 외의 모든 마크다운(##, **, ``` 등) 사용 금지. 단독 < 또는 > 기호 절대 금지.
+                  [★ 엄격 통제 지시사항 ★]
+                  1. 제공된 종목명, 가격, 비중 숫자를 단 하나도 바꾸거나 지어내지 마라.
+                  2. 증권사 퀀트 데스크의 드라이(Dry)한 어조로 객관적 팩트만 서술해라.
+                  3. <b> 텍스트 </b> 외의 모든 마크다운(##, **, ``` 등) 사용 금지. 단독 < 또는 > 기호 절대 금지.
 
-              [★ 출력 템플릿 ★]
-              <b>📊 [{today_print}] 스마트머니(기관) 수급 브리핑</b>
+                  [★ 출력 템플릿 ★]
+                  <b>📊 [{today_str}] 스마트머니(기관) 수급 브리핑</b>
 
-              ━━━━━━━━━━━━━━━━━━━
-              <b>1. 🛡️ 기관계 매집 상위 5선</b>
+                  ━━━━━━━━━━━━━━━━━━━
+                  <b>1. 🛡️ 기관계 매집 상위 5선</b>
 
-              <b>■ 1. 종목명 (현재가 / 등락률)</b>
-              • <b>수급 팩트:</b> 순매수 OOO억 / 거래량 대비 O.O% / 주식수 대비 O.OO%
-              • <b>분석:</b> (유통물량 잠식 및 수급 가속도 관점의 코멘트 1줄)
+                  <b>■ 1. 종목명 (현재가 / 등락률)</b>
+                  • <b>수급 팩트:</b> 순매수 OOO억 / 거래량 대비 O.O% / 주식수 대비 O.OO%
+                  • <b>분석:</b> (유통물량 잠식 및 수급 가속도 관점의 코멘트 1줄)
 
-              (2위부터 5위까지 동일하게 작성)
+                  (위 포맷으로 제공된 데이터 개수만큼 순차적으로 작성)
 
-              ━━━━━━━━━━━━━━━━━━━
-              <b>2. 💡 수급 특이사항 요약</b>
-              • (오늘 기관 수급의 전반적인 특징 1~2줄 요약)
-              """
+                  ━━━━━━━━━━━━━━━━━━━
+                  <b>2. 💡 수급 특이사항 요약</b>
+                  • (오늘 기관 수급의 전반적인 특징 1~2줄 요약)
+                  """
 
-              payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                  payload = {"contents": [{"parts": [{"text": prompt}]}]}
+                  
+                  last_error = ""
+                  for attempt in range(3):
+                      try:
+                          res = requests.post(self.api_url, json=payload, timeout=60)
+                          if res.status_code == 200:
+                              text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                              return text.replace("```html", "").replace("```", "").strip()
+                          else:
+                              last_error = f"HTTP {res.status_code}: {res.text}"
+                      except Exception as e:
+                          last_error = str(e)
+                      time.sleep(3)
+                      
+                  raise Exception(f"Gemini AI 리포트 생성 3회 실패. 최종 에러: {last_error}")
+
+          # ==============================================================================
+          # 5. 메인 실행 흐름
+          # ==============================================================================
+          def main():
+              logger.info("퀀트 에이전트 실행 시작")
               
-              # 확실하게 동작하는 구글 최신 버전 고정
-              gemini_url = f"{HTTP}{GEMINI_DOMAIN}/v1beta/models/gemini-3.6-flash:generateContent?key={gemini_key}"
+              if not Config.GEMINI_KEY or not Config.TG_TOKEN or not Config.TG_CHAT_ID:
+                  logger.critical("환경 변수가 누락되었습니다.")
+                  sys.exit(1)
 
-              report_text = ""
-              for attempt in range(1, 4):
-                  res = requests.post(gemini_url, json=payload, timeout=60)
-                  if res.status_code == 200:
-                      report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                      break
-                  time.sleep(3)
-
-              if not report_text: 
-                  raise Exception(f"Gemini API 응답 실패. HTTP {res.status_code}: {res.text}")
-
-              report_text = report_text.replace("```html", "").replace("```", "").strip()
-
-              print("4. 텔레그램 발송 중...")
-              if not send_tg(report_text):
-                  raise Exception("텔레그램 전송 API 실패")
+              notifier = TelegramNotifier()
               
-              print("🎉 정상 실행 및 전송 완료")
+              try:
+                  today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                  
+                  scraper = MarketScraper()
+                  analyzer = QuantAnalyzer(scraper)
+                  reporter = ReportGenerator(Config.GEMINI_API)
 
-          except Exception as e:
-              error_msg = f"⚠️ [에러 발생] 퀀트 봇 실행 중 문제가 발생했습니다.\n\n{traceback.format_exc()}"
-              print(error_msg)
-              send_tg(error_msg)
-              sys.exit(1)
+                  logger.info("코스피/코스닥 기관 수급 데이터 수집 시작")
+                  raw_data = scraper.fetch_institution_rank('1') + scraper.fetch_institution_rank('2')
+                  
+                  logger.info(f"총 {len(raw_data)}개의 유효 수급 데이터 파싱 완료.")
+                  inst_list = analyzer.process_top_stocks(raw_data, top_n=5)
+                  
+                  logger.info("AI 브리핑 리포트 생성 시작")
+                  report_text = reporter.generate(inst_list, today_str)
+                  
+                  logger.info("텔레그램 발송 시작")
+                  if notifier.send_safe(report_text):
+                      logger.info("🎉 모든 프로세스 정상 완료 및 발송 성공")
+                  else:
+                      raise Exception("텔레그램 발송 API 최종 실패")
+
+              except Exception as e:
+                  err_msg = f"⚠️ [에러 발생] 퀀트 봇 장애 보고\n\n{traceback.format_exc()}"
+                  logger.error(err_msg)
+                  notifier.send_safe(err_msg)
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
           EOF
 
           python run_agent.py
