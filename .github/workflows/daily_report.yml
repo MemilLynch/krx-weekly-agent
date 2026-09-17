@@ -2,233 +2,173 @@ name: Daily KRX Quant Agent
 
 on:
   schedule:
-    - cron: '10 7 * * 1-5' # KST 16:10
+    - cron: '40 8 * * 1-5'   # KST 17:40 (수급 확정 이후)
   workflow_dispatch:
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
     steps:
-      - name: Python 3.11 설정
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 필수 라이브러리 설치
-        run: pip install requests beautifulsoup4 pandas lxml
+      - name: 라이브러리 설치
+        run: pip install --upgrade pykrx pandas requests
 
-      - name: 외국인/기관 섹터 수급 분석 및 텔레그램 전송
+      - name: 수급 분석 및 텔레그램 전송
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat << 'EOF' > run_agent.py
-          import os, sys, time, datetime, re, logging, traceback, random, requests
+          import os, sys, time, datetime, logging, traceback, requests
           import pandas as pd
-          from bs4 import BeautifulSoup
+          from pykrx import stock
 
-          # ==============================================================================
-          # 0. 로깅 및 환경 설정
-          # ==============================================================================
           logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-          logger = logging.getLogger("QuantAgent")
+          log = logging.getLogger("QuantAgent")
 
-          class Config:
-              GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip('\'"')
-              TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('\'"')
-              TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip('\'"')
-              
-              if TG_TOKEN.lower().startswith("bot"): TG_TOKEN = TG_TOKEN[3:]
-                  
-              HTTP = "https://"
-              TG_API = f"{HTTP}api.telegram.org/bot{TG_TOKEN}"
-              # 확실하게 동작하는 3.6-flash 버전 고정
-              GEMINI_API = f"{HTTP}generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_KEY}"
-              
-              USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"]
-              NOISE_KEYWORDS = ["TIGER", "KODEX", "ACE", "RISE", "SOL", "PLUS", "KBSTAR", "KOSEF", "스팩", "레버리지", "인버스", "ETN", "선물", "차이나", "베트남", "미국"]
+          KEY  = os.getenv("GEMINI_API_KEY","").strip('\'"')
+          TOK  = os.getenv("TELEGRAM_BOT_TOKEN","").strip('\'"')
+          CHAT = os.getenv("TELEGRAM_CHAT_ID","").strip('\'"')
+          if TOK.lower().startswith("bot"): TOK = TOK[3:]
 
-          # ==============================================================================
-          # 1. 텔레그램 알림 시스템
-          # ==============================================================================
-          class TelegramNotifier:
-              def send(self, text, parse_mode="HTML"):
-                  payload = {"chat_id": Config.TG_CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True, "disable_notification": True}
-                  for _ in range(3):
-                      try:
-                          r = requests.post(f"{Config.TG_API}/sendMessage", json=payload, timeout=15)
-                          if r.status_code == 200 and r.json().get("ok"): return True
-                      except: time.sleep(2)
-                  return False
+          MODEL = "gemini-2.5-flash"
+          GEM = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={KEY}"
+          TG  = f"https://api.telegram.org/bot{TOK}"
 
-              def send_safe(self, text):
-                  if not self.send(text, parse_mode="HTML"):
-                      clean_text = text.replace("<b>", "").replace("</b>", "").replace("<", "").replace(">", "")
-                      return self.send(f"⚠️ [포맷 경고] 일반 텍스트 모드\n\n{clean_text}", parse_mode="")
-                  return True
+          NOISE = ["TIGER","KODEX","ACE","RISE","SOL","PLUS","KBSTAR","KOSEF","ARIRANG",
+                   "히어로즈","스팩","레버리지","인버스","ETN","선물","우B","우C"]
 
-          # ==============================================================================
-          # 2. 네이버 금융 크롤러 (외국인 9000, 기관 1000)
-          # ==============================================================================
-          class MarketScraper:
-              def __init__(self):
-                  self.session = requests.Session()
+          def send(text, mode="HTML"):
+              p = {"chat_id":CHAT,"text":text,"parse_mode":mode,
+                   "disable_web_page_preview":True,"disable_notification":True}
+              for _ in range(3):
+                  try:
+                      r = requests.post(f"{TG}/sendMessage", json=p, timeout=15)
+                      if r.status_code == 200 and r.json().get("ok"): return True
+                      log.error("TG 응답: %s", r.text[:300])
+                  except Exception as e: log.error("TG 예외: %s", e)
+                  time.sleep(2)
+              return False
 
-              def _get_html(self, url):
-                  for _ in range(3):
-                      try:
-                          self.session.headers.update({"User-Agent": random.choice(Config.USER_AGENTS)})
-                          res = self.session.get(url, timeout=10)
-                          return BeautifulSoup(res.content.decode("cp949", errors="ignore"), "html.parser")
-                      except: time.sleep(2)
-                  return None
+          def send_safe(text):
+              if send(text): return True
+              clean = text.replace("<b>","").replace("</b>","").replace("<","").replace(">","")
+              return send(f"[포맷경고] 일반텍스트\n\n{clean}", mode="")
 
-              def fetch_rank(self, market_code, investor_code):
-                  url = f"{Config.HTTP}finance.naver.com/sise/sise_deal_rank_iframe.naver?investor_gubun={investor_code}&type=buy&mkt_gb={market_code}"
-                  soup = self._get_html(url)
-                  if not soup: return []
+          def last_trading_day():
+              # 최근 영업일(휴장일이면 자동으로 이전 영업일)
+              today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+              return stock.get_nearest_business_day_in_a_week(today.strftime("%Y%m%d"))
 
-                  data_list = []
-                  for tr in soup.find_all("tr"):
-                      a_tag = tr.find("a", href=re.compile(r'code=\d{6}'))
-                      if not a_tag: continue
-                      
-                      name = a_tag.text.strip()
-                      if any(k in name for k in Config.NOISE_KEYWORDS): continue
-                      code = re.search(r'code=(\d{6})', a_tag['href']).group(1)
-                      
-                      tds = tr.find_all("td")
-                      if len(tds) < 6: continue
+          def fetch(day, investor):
+              frames = []
+              for mkt in ["KOSPI","KOSDAQ"]:
+                  df = stock.get_market_net_purchases_of_equities(day, day, mkt, investor)
+                  if df is None or df.empty:
+                      log.warning("%s/%s 비어있음", mkt, investor); continue
+                  df = df.reset_index()
+                  frames.append(df)
+              if not frames:
+                  raise RuntimeError(f"{investor} 수급 데이터 수집 실패 (day={day})")
+              out = pd.concat(frames, ignore_index=True)
+              out = out[~out["종목명"].str.contains("|".join(NOISE), na=False)]
+              out = out[out["순매수거래대금"] > 0]
+              return out.sort_values("순매수거래대금", ascending=False).head(20)
 
-                      try:
-                          price = int(re.sub(r'[^\d]', '', tds[2].text))
-                          rate_text = tds[4].text.strip()
-                          net_vol = int(re.sub(r'[^\d-]', '', tds[5].text))
-                          if price < 100 or net_vol <= 0: continue
-
-                          net_amt = price * net_vol # 순매수대금(원)
-                          data_list.append({"종목명": name, "종목코드": code, "현재가": price, "등락률": rate_text, "순매수량": net_vol, "순매수대금": net_amt})
-                      except: continue
-                  return data_list
-
-          # ==============================================================================
-          # 3. 데이터 분석기 (섹터 분석을 위해 상위 20개 추출)
-          # ==============================================================================
-          def process_data(df_raw, top_n=20):
-              if df_raw.empty: return "데이터 없음"
-              df = df_raw.sort_values(by='순매수대금', ascending=False).head(top_n)
+          def to_text(df, day):
               lines = []
               for _, r in df.iterrows():
-                  amt_억 = round(r['순매수대금'] / 100000000, 1)
-                  lines.append(f"{r['종목명']} ({r['현재가']:,}원/{r['등락률']}) - 순매수 {amt_억:,}억")
+                  code = r.get("티커") or r.get("종목코드") or ""
+                  try:
+                      o = stock.get_market_ohlcv(day, day, str(code)).iloc[0]
+                      price, chg = f"{int(o['종가']):,}원", f"{o['등락률']:+.2f}%"
+                  except Exception:
+                      price, chg = "-", "-"
+                  amt = round(r["순매수거래대금"]/1e8, 1)
+                  lines.append(f"{r['종목명']} ({price}/{chg}) - 순매수 {amt:,}억")
               return "\n".join(lines)
 
-          # ==============================================================================
-          # 4. 메인 실행 흐름 및 Gemini AI 섹터 분석 템플릿
-          # ==============================================================================
+          def gemini(prompt):
+              payload = {"contents":[{"parts":[{"text":prompt}]}]}
+              for _ in range(3):
+                  try:
+                      r = requests.post(GEM, json=payload, timeout=90)
+                      if r.status_code == 200:
+                          return r.json()["candidates"][0]["content"]["parts"][0]["text"] \
+                                  .replace("```html","").replace("```","").strip()
+                      log.error("Gemini %s: %s", r.status_code, r.text[:400])
+                  except Exception as e: log.error("Gemini 예외: %s", e)
+                  time.sleep(3)
+              raise RuntimeError("Gemini API 응답 실패")
+
           def main():
-              logger.info("퀀트 에이전트 실행 시작")
-              if not Config.GEMINI_KEY: sys.exit(1)
-              notifier = TelegramNotifier()
-              
+              if not (KEY and TOK and CHAT):
+                  log.error("시크릿 누락"); sys.exit(1)
               try:
-                  today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-                  scraper = MarketScraper()
+                  day = last_trading_day()
+                  d = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+                  log.info("기준 영업일 %s", d)
 
-                  logger.info("외국인/기관 수급 데이터 수집 중...")
-                  # 외인(9000), 기관(1000) 코스피(1)+코스닥(2)
-                  frgn_data = scraper.fetch_rank('1', '9000') + scraper.fetch_rank('2', '9000')
-                  inst_data = scraper.fetch_rank('1', '1000') + scraper.fetch_rank('2', '1000')
+                  frgn = to_text(fetch(day, "외국인"), day)
+                  inst = to_text(fetch(day, "기관합계"), day)
+                  log.info("외국인 %d행 / 기관 %d행", len(frgn.splitlines()), len(inst.splitlines()))
 
-                  frgn_str = process_data(pd.DataFrame(frgn_data), 20)
-                  inst_str = process_data(pd.DataFrame(inst_data), 20)
+                  prompt = f"""오늘({d}) 국내 증시 외국인·기관 순매수 상위 20종목(금액순) 원시 데이터다.
+          개별 종목 1~5위를 나열하지 말고, 어떤 섹터(테마)에 자금이 집중됐는지 분석해 섹터별 1,2,3위를 도출해라.
 
-                  logger.info("AI 브리핑(섹터 분석) 리포트 생성 중...")
-                  
-                  prompt = f"""
-                  오늘({today_str}) 국내 증시 외국인 및 기관 순매수 상위 20종목(금액순) 원시 데이터다.
-                  이 데이터를 기반으로 개별 종목 1~5위를 나열하지 말고, **어떤 섹터(테마)에 자금이 집중되었는지 스스로 분석해서 섹터별 1,2,3위를 도출해라.**
+          [외국인 순매수 TOP 20]
+          {frgn}
 
-                  [외국인 순매수 TOP 20]
-                  {frgn_str}
+          [기관합계 순매수 TOP 20]
+          {inst}
 
-                  [기관합계 순매수 TOP 20]
-                  {inst_str}
+          [엄격 통제]
+          1. 종목 단순 나열 금지. 반드시 산업/섹터 단위로 묶어라.
+          2. 증권사 리서치 데스크의 드라이하고 냉정한 어조로 팩트만 서술.
+          3. 제공된 데이터 외 허위 사실 금지.
+          4. <b>텍스트</b> 외 모든 마크다운 금지. 단독 < > 기호 금지.
 
-                  [★ 엄격 통제 지시사항 ★]
-                  1. 종목별 랭킹을 단순 나열하지 마라. 반드시 산업/섹터 단위로 묶어서 1~3위를 제시해라.
-                  2. 증권사 리서치 데스크의 드라이(Dry)하고 냉정한 어조(차익실현, 수급 핑퐁, 윗꼬리 폭탄 등)로 객관적 팩트만 서술해라.
-                  3. 제공된 데이터(금액, 등락률) 외에 허위 사실을 지어내지 마라.
-                  4. <b> 텍스트 </b> 외의 모든 마크다운(##, **, ``` 등) 사용 절대 금지. 단독 < 또는 > 기호 절대 금지.
+          [출력 템플릿]
+          <b>📊 [{d}] 증시 수급 실상 & 섹터별 주도 동향</b>
 
-                  [★ 출력 템플릿 ★]
-                  <b>📊 [{today_str}] 증시 수급 실상 & 섹터별 주도 동향</b>
+          ━━━━━━━━━━━━━━━━━━━
+          <b>1. 📌 오늘 시장 수급 실상</b>
+          • (외인/기관 포지션 차이, 자금 이동 1~2줄)
 
-                  ━━━━━━━━━━━━━━━━━━━
-                  <b>1. 📌 오늘 시장 수급 실상</b>
-                  • (외인과 기관의 포지션 차이, 자금 이동 등 오늘 장세의 냉정한 팩트 1~2줄 요약)
+          ━━━━━━━━━━━━━━━━━━━
+          <b>2. 🏆 메이저 수급 유입 TOP 3 섹터</b>
+          <b>■ 1위 섹터: [섹터명]</b>
+          • <b>주도 주체:</b> (외인/기관/쌍끌이)
+          • <b>주요 매집주:</b> (종목 2~3개)
+          • <b>섹터 팩트:</b> (1줄)
+          (2위·3위 동일 포맷)
 
-                  ━━━━━━━━━━━━━━━━━━━
-                  <b>2. 🏆 메이저 수급 유입 TOP 3 섹터</b>
-                  (단순 종목 나열 금지. 데이터를 분석해 돈이 몰린 섹터를 3개 도출할 것)
+          ━━━━━━━━━━━━━━━━━━━
+          <b>3. 🔥 당일 메이저 수급 주도주 3선</b>
+          <b>■ 1. 종목명 (현재가 / 등락률)</b>
+          • <b>수급 팩트:</b>
+          • <b>차트 팩트:</b>
+          • <b>경계 라인:</b>
+          (2위·3위 동일 포맷)
 
-                  <b>■ 1위 섹터: [섹터명 기입]</b>
-                  • <b>주도 주체:</b> (외인 or 기관 or 쌍끌이)
-                  • <b>주요 매집주:</b> (종목명 2~3개 기입)
-                  • <b>섹터 팩트:</b> (해당 섹터로 수급이 몰린 특징이나 리스크 관점 코멘트 1줄)
+          ━━━━━━━━━━━━━━━━━━━
+          <b>4. 💡 내일장 수급 경계령 & 체크포인트</b>
+          • (기계적 리스크 관리 1~2줄)"""
 
-                  <b>■ 2위 섹터: [섹터명 기입]</b>
-                  • <b>주도 주체:</b> 
-                  • <b>주요 매집주:</b> 
-                  • <b>섹터 팩트:</b> 
+                  if not send_safe(gemini(prompt)):
+                      raise RuntimeError("텔레그램 전송 실패")
+                  log.info("전송 완료")
 
-                  <b>■ 3위 섹터: [섹터명 기입]</b>
-                  • <b>주도 주체:</b> 
-                  • <b>주요 매집주:</b> 
-                  • <b>섹터 팩트:</b> 
-
-                  ━━━━━━━━━━━━━━━━━━━
-                  <b>3. 🔥 당일 메이저 수급 주도주 3선</b>
-                  (제공된 데이터에서 가장 수급 특징이 뚜렷한 3종목을 선정하여 기술적/수급적 관점으로 분석)
-
-                  <b>■ 1. 종목명 (현재가 / 등락률)</b>
-                  • <b>수급 팩트:</b> (외인 OOO억 / 기관 OOO억 등 수급 요약)
-                  • <b>차트 팩트:</b> (기관 주도 띄우기, 외인 매물 폭탄 등 냉정한 코멘트)
-                  • <b>경계 라인:</b> (수급 이탈 시 급반전 위험, 손절 라인 등 기계적 대응 요망 코멘트)
-
-                  (2위, 3위 종목도 동일한 포맷으로 작성)
-
-                  ━━━━━━━━━━━━━━━━━━━
-                  <b>4. 💡 내일장 수급 경계령 & 체크포인트</b>
-                  • (기관 혼자 받아서 올린 종목의 위험성, 단기 이격도 주의 등 냉정하고 기계적인 리스크 관리 전략 1~2줄 요약)
-                  """
-
-                  payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                  
-                  report_text = ""
-                  for attempt in range(3):
-                      try:
-                          res = requests.post(Config.GEMINI_API, json=payload, timeout=60)
-                          if res.status_code == 200:
-                              report_text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                              report_text = report_text.replace("```html", "").replace("```", "").strip()
-                              break
-                      except: time.sleep(3)
-
-                  if not report_text: raise Exception("Gemini API 응답 실패")
-
-                  logger.info("텔레그램 발송 중...")
-                  if not notifier.send_safe(report_text): raise Exception("텔레그램 전송 실패")
-                  logger.info("🎉 섹터 랭킹 및 브리핑 전송 완료")
-
-              except Exception as e:
-                  err_msg = f"⚠️ [에러 발생]\n{traceback.format_exc()}"
-                  TelegramNotifier().send_safe(err_msg)
+              except Exception:
+                  tb = traceback.format_exc()
+                  log.error(tb)
+                  send_safe(f"⚠️ [에러 발생]\n{tb[-3000:]}")
                   sys.exit(1)
 
-          if __name__ == "__main__":
-              main()
+          main()
           EOF
-
           python run_agent.py
