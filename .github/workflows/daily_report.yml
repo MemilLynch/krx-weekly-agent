@@ -2,173 +2,45 @@ name: Daily KRX Quant Agent
 
 on:
   schedule:
-    - cron: '40 8 * * 1-5'   # KST 17:40 (수급 확정 이후)
+    - cron: '40 8 * * 1-5'   # KST 17:40
   workflow_dispatch:
+    inputs:
+      probe_only:
+        description: '데이터 소스 진단만 수행 (텔레그램 발송 안 함)'
+        type: boolean
+        default: false
+      force_date:
+        description: '기준일 강제 지정 (YYYYMMDD, 비우면 자동)'
+        default: ''
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: 라이브러리 설치
-        run: pip install --upgrade pykrx pandas requests
+      - run: pip install requests pandas beautifulsoup4 lxml
 
-      - name: 수급 분석 및 텔레그램 전송
+      - name: 수급 분석 실행
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          cat << 'EOF' > run_agent.py
-          import os, sys, time, datetime, logging, traceback, requests
-          import pandas as pd
-          from pykrx import stock
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROBE_ONLY:  ${{ inputs.probe_only }}
+          FORCE_DATE:  ${{ inputs.force_date }}
+        run: python run_agent.py
 
-          logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-          log = logging.getLogger("QuantAgent")
-
-          KEY  = os.getenv("GEMINI_API_KEY","").strip('\'"')
-          TOK  = os.getenv("TELEGRAM_BOT_TOKEN","").strip('\'"')
-          CHAT = os.getenv("TELEGRAM_CHAT_ID","").strip('\'"')
-          if TOK.lower().startswith("bot"): TOK = TOK[3:]
-
-          MODEL = "gemini-2.5-flash"
-          GEM = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={KEY}"
-          TG  = f"https://api.telegram.org/bot{TOK}"
-
-          NOISE = ["TIGER","KODEX","ACE","RISE","SOL","PLUS","KBSTAR","KOSEF","ARIRANG",
-                   "히어로즈","스팩","레버리지","인버스","ETN","선물","우B","우C"]
-
-          def send(text, mode="HTML"):
-              p = {"chat_id":CHAT,"text":text,"parse_mode":mode,
-                   "disable_web_page_preview":True,"disable_notification":True}
-              for _ in range(3):
-                  try:
-                      r = requests.post(f"{TG}/sendMessage", json=p, timeout=15)
-                      if r.status_code == 200 and r.json().get("ok"): return True
-                      log.error("TG 응답: %s", r.text[:300])
-                  except Exception as e: log.error("TG 예외: %s", e)
-                  time.sleep(2)
-              return False
-
-          def send_safe(text):
-              if send(text): return True
-              clean = text.replace("<b>","").replace("</b>","").replace("<","").replace(">","")
-              return send(f"[포맷경고] 일반텍스트\n\n{clean}", mode="")
-
-          def last_trading_day():
-              # 최근 영업일(휴장일이면 자동으로 이전 영업일)
-              today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-              return stock.get_nearest_business_day_in_a_week(today.strftime("%Y%m%d"))
-
-          def fetch(day, investor):
-              frames = []
-              for mkt in ["KOSPI","KOSDAQ"]:
-                  df = stock.get_market_net_purchases_of_equities(day, day, mkt, investor)
-                  if df is None or df.empty:
-                      log.warning("%s/%s 비어있음", mkt, investor); continue
-                  df = df.reset_index()
-                  frames.append(df)
-              if not frames:
-                  raise RuntimeError(f"{investor} 수급 데이터 수집 실패 (day={day})")
-              out = pd.concat(frames, ignore_index=True)
-              out = out[~out["종목명"].str.contains("|".join(NOISE), na=False)]
-              out = out[out["순매수거래대금"] > 0]
-              return out.sort_values("순매수거래대금", ascending=False).head(20)
-
-          def to_text(df, day):
-              lines = []
-              for _, r in df.iterrows():
-                  code = r.get("티커") or r.get("종목코드") or ""
-                  try:
-                      o = stock.get_market_ohlcv(day, day, str(code)).iloc[0]
-                      price, chg = f"{int(o['종가']):,}원", f"{o['등락률']:+.2f}%"
-                  except Exception:
-                      price, chg = "-", "-"
-                  amt = round(r["순매수거래대금"]/1e8, 1)
-                  lines.append(f"{r['종목명']} ({price}/{chg}) - 순매수 {amt:,}억")
-              return "\n".join(lines)
-
-          def gemini(prompt):
-              payload = {"contents":[{"parts":[{"text":prompt}]}]}
-              for _ in range(3):
-                  try:
-                      r = requests.post(GEM, json=payload, timeout=90)
-                      if r.status_code == 200:
-                          return r.json()["candidates"][0]["content"]["parts"][0]["text"] \
-                                  .replace("```html","").replace("```","").strip()
-                      log.error("Gemini %s: %s", r.status_code, r.text[:400])
-                  except Exception as e: log.error("Gemini 예외: %s", e)
-                  time.sleep(3)
-              raise RuntimeError("Gemini API 응답 실패")
-
-          def main():
-              if not (KEY and TOK and CHAT):
-                  log.error("시크릿 누락"); sys.exit(1)
-              try:
-                  day = last_trading_day()
-                  d = f"{day[:4]}-{day[4:6]}-{day[6:]}"
-                  log.info("기준 영업일 %s", d)
-
-                  frgn = to_text(fetch(day, "외국인"), day)
-                  inst = to_text(fetch(day, "기관합계"), day)
-                  log.info("외국인 %d행 / 기관 %d행", len(frgn.splitlines()), len(inst.splitlines()))
-
-                  prompt = f"""오늘({d}) 국내 증시 외국인·기관 순매수 상위 20종목(금액순) 원시 데이터다.
-          개별 종목 1~5위를 나열하지 말고, 어떤 섹터(테마)에 자금이 집중됐는지 분석해 섹터별 1,2,3위를 도출해라.
-
-          [외국인 순매수 TOP 20]
-          {frgn}
-
-          [기관합계 순매수 TOP 20]
-          {inst}
-
-          [엄격 통제]
-          1. 종목 단순 나열 금지. 반드시 산업/섹터 단위로 묶어라.
-          2. 증권사 리서치 데스크의 드라이하고 냉정한 어조로 팩트만 서술.
-          3. 제공된 데이터 외 허위 사실 금지.
-          4. <b>텍스트</b> 외 모든 마크다운 금지. 단독 < > 기호 금지.
-
-          [출력 템플릿]
-          <b>📊 [{d}] 증시 수급 실상 & 섹터별 주도 동향</b>
-
-          ━━━━━━━━━━━━━━━━━━━
-          <b>1. 📌 오늘 시장 수급 실상</b>
-          • (외인/기관 포지션 차이, 자금 이동 1~2줄)
-
-          ━━━━━━━━━━━━━━━━━━━
-          <b>2. 🏆 메이저 수급 유입 TOP 3 섹터</b>
-          <b>■ 1위 섹터: [섹터명]</b>
-          • <b>주도 주체:</b> (외인/기관/쌍끌이)
-          • <b>주요 매집주:</b> (종목 2~3개)
-          • <b>섹터 팩트:</b> (1줄)
-          (2위·3위 동일 포맷)
-
-          ━━━━━━━━━━━━━━━━━━━
-          <b>3. 🔥 당일 메이저 수급 주도주 3선</b>
-          <b>■ 1. 종목명 (현재가 / 등락률)</b>
-          • <b>수급 팩트:</b>
-          • <b>차트 팩트:</b>
-          • <b>경계 라인:</b>
-          (2위·3위 동일 포맷)
-
-          ━━━━━━━━━━━━━━━━━━━
-          <b>4. 💡 내일장 수급 경계령 & 체크포인트</b>
-          • (기계적 리스크 관리 1~2줄)"""
-
-                  if not send_safe(gemini(prompt)):
-                      raise RuntimeError("텔레그램 전송 실패")
-                  log.info("전송 완료")
-
-              except Exception:
-                  tb = traceback.format_exc()
-                  log.error(tb)
-                  send_safe(f"⚠️ [에러 발생]\n{tb[-3000:]}")
-                  sys.exit(1)
-
-          main()
-          EOF
-          python run_agent.py
+      - name: 디버그 아티팩트 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-dump
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
